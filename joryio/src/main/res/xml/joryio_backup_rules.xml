@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Joryio SDK backup exclusions for Android 11 and lower
+  (android:fullBackupContent). Reference this file from your manifest, or copy
+  its <exclude> lines into your own rules file - see the SDK README, "Backup".
+
+  What is NOT listed and why:
+    - the event queue lives in noBackupFilesDir, which is never backed up;
+    - the identity store's file name depends on your SDK key, so it cannot be
+      named here. If it is restored, the SDK detects that it cannot be
+      decrypted (Keystore keys are never backed up) and recreates it.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="joryio_pending_enc.xml" />
+    <exclude domain="sharedpref" path="joryio_pending.xml" />
+    <exclude domain="sharedpref" path="joryio_push_permission.xml" />
+    <exclude domain="sharedpref" path="joryio_push_settings.xml" />
+</full-backup-content>
