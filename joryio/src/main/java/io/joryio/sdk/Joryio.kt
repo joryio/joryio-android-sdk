@@ -2335,8 +2335,9 @@ class Joryio private constructor(
     /**
      * What a displayed message reports back (BACKLOG C23, 2026-09-26). The
      * impression actions (displayed / clicked / dismissed / converted) go to
-     * the tracker as before; the rest are the bridge methods a message script
-     * calls, which used to be silent no-ops on Android:
+     * the tracker as before; the rest are the bridge methods the SDK's
+     * bootstrap calls for a message's buttons and forms, which used to be
+     * silent no-ops on Android:
      * `joryioBridge.logCustomEvent`, `setCustomUserAttribute`, `changeUser`,
      * `requestPushPermission`, `logConversion` and `submitForm`. Kept in the
      * base SDK so joryio-ui stays free of a compile-time dependency on it.

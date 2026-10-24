@@ -32,15 +32,18 @@ import io.joryio.sdk.models.MessageType
  * placement, URL safety rules) this follows it.
  *
  * The message document is UNTRUSTED in the same sense a web page is: it is
- * authored in the dashboard, but it is arbitrary HTML/JS running inside the
- * host app. So it gets no file access, no ability to navigate the app, and it
- * reaches the SDK only through the four explicit bridge methods below.
+ * authored in the dashboard and kept as written by the server, so it may
+ * carry <script> and on* handlers. Those do not run - the nonce CSP in
+ * buildDocument lets only the SDK's bootstrap execute - and the document gets
+ * no file access, no ability to navigate the app, and reaches the SDK only
+ * through the explicit bridge methods below.
  */
 internal class InAppMessageRenderer(
     /**
-     * Whether HTML in-app messages may run. See
+     * Whether HTML in-app messages are displayed. See
      * JoryioConfig.allowHtmlJsInAppMessages - off by default, because an
-     * HTML message executes author-supplied JavaScript inside the host app.
+     * HTML message needs a JavaScript-enabled WebView inside the host app
+     * (author script in it is blocked by the CSP; only the bridge runs).
      */
     private val allowHtmlJsInAppMessages: Boolean = false,
 ) {
@@ -111,8 +114,9 @@ internal class InAppMessageRenderer(
         }
         val html = content as InAppContent.Html
 
-        // HTML runs author-supplied JavaScript in this app's process. An app
-        // that has not opted in never reaches a WebView at all - and this is a
+        // HTML needs a JavaScript-enabled WebView in this app's process (only
+        // the SDK bridge runs; the CSP blocks author script). An app that has
+        // not opted in never reaches a WebView at all - and this is a
         // SKIP, not a failure: native campaigns keep displaying, so the channel
         // stays usable rather than becoming all-or-nothing.
         if (!allowHtmlJsInAppMessages) {
@@ -126,7 +130,7 @@ internal class InAppMessageRenderer(
         val webView = WebView(activity).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            // No filesystem or content-provider reach from message JS.
+            // No filesystem or content-provider reach from the document.
             settings.allowFileAccess = false
             settings.allowContentAccess = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -380,11 +384,12 @@ internal class InAppMessageRenderer(
         /*
          * A fresh, unpredictable nonce per message.
          *
-         * The server strips <script> and every on* handler before this HTML is
-         * sent, so no author JavaScript runs today. The residual risk is a
-         * sanitiser bypass, and this WebView has JavaScript enabled because the
-         * bootstrap below needs it. The nonce means only that bootstrap can
-         * execute - anything that survives sanitisation still cannot.
+         * The server keeps the author's markup as written (it drops only
+         * <base> and meta refresh), so <script> and on* handlers ARE in this
+         * document, and this WebView has JavaScript enabled because the
+         * bootstrap below needs it. The nonce is the control: only that
+         * bootstrap can execute, so nothing the author wrote runs. There is no
+         * server sanitiser in front of it.
          *
          * SecureRandom, not Random: a guessable nonce is one an attacker can
          * put on their own injected <script>, which defeats the point entirely.
@@ -585,7 +590,8 @@ internal class InAppMessageRenderer(
     // ── Bridge ──────────────────────────────────────────────────────────────
 
     /**
-     * The ONLY surface message JS can reach. Method names match the web SDK's
+     * The ONLY surface the document's script - the SDK bootstrap; the CSP
+     * blocks author script - can reach. Method names match the web SDK's
      * `joryioBridge` so a template authored once works on both.
      */
     private class Bridge(
