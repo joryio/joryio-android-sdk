@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Internet permission for API calls -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Optional: For push notifications -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      Backup: deliberately NOT set on <application> here. A library that sets
+      android:fullBackupContent / android:dataExtractionRules makes the
+      manifest merge FAIL for every app that has its own rules. Instead:
+        - the event queue lives in noBackupFilesDir, which the platform never
+          backs up;
+        - an encrypted store restored without its Keystore key is detected
+          and recreated (SecurePrefs);
+        - @xml/joryio_backup_rules and @xml/joryio_data_extraction_rules ship
+          in this library for apps that want the exclusions spelled out -
+          see the README, "Backup".
+    -->
+    <application>
+        <!-- Lifecycle observer for automatic session tracking -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <!-- Gives the SDK the application context at process start, so a
+                 privacy decision made BEFORE initialize() (optOut, consent,
+                 wipeData) is written to disk rather than held in memory. -->
+            <meta-data
+                android:name="io.joryio.sdk.core.JoryioContextInitializer"
+                android:value="androidx.startup" />
+        </provider>
+
+        <!-- Invisible trampoline: tracks push clicks ON TAP, then forwards to the
+             host launcher. Not exported; translucent + no-history so it shows no UI
+             and never appears in recents. -->
+        <activity
+            android:name="io.joryio.sdk.push.JoryioNotificationTrampolineActivity"
+            android:exported="false"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Invisible host for the notification-permission dialog when the
+             app's own Activity cannot host it (a plain android.app.Activity,
+             e.g. Unity's). Reports the answer when the dialog closes. -->
+        <activity
+            android:name="io.joryio.sdk.push.JoryioPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+
+</manifest>

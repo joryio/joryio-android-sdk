@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Joryio SDK backup exclusions for Android 12 and higher
+  (android:dataExtractionRules). Reference this file from your manifest, or
+  copy its <exclude> lines into your own rules file - see the SDK README,
+  "Backup". The same reasoning as joryio_backup_rules.xml applies.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="joryio_pending_enc.xml" />
+        <exclude domain="sharedpref" path="joryio_pending.xml" />
+        <exclude domain="sharedpref" path="joryio_push_permission.xml" />
+        <exclude domain="sharedpref" path="joryio_push_settings.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="joryio_pending_enc.xml" />
+        <exclude domain="sharedpref" path="joryio_pending.xml" />
+        <exclude domain="sharedpref" path="joryio_push_permission.xml" />
+        <exclude domain="sharedpref" path="joryio_push_settings.xml" />
+    </device-transfer>
+</data-extraction-rules>
