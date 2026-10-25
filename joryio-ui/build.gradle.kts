@@ -37,6 +37,9 @@ android {
         targetSdk = 34
         // Shipped inside the AAR; see the file. It was declared and missing.
         consumerProguardFiles("consumer-rules.pro")
+        // On-device checks of the HTML message document (androidTest/); run
+        // with ./gradlew :joryio-ui:connectedDebugAndroidTest on an emulator.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -104,6 +107,8 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
 }
 
 publishing {

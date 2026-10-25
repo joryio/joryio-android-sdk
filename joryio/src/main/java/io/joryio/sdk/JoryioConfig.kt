@@ -39,22 +39,25 @@ data class JoryioConfig @JvmOverloads constructor(
 
 
     /**
-     * Allow in-app messages authored as HTML, which can execute JavaScript
-     * inside your app.
+     * Allow in-app messages authored as HTML, shown in a JavaScript-enabled
+     * WebView inside your app.
      *
      * OFF BY DEFAULT. The name carries both halves on purpose: `Html…
      * InAppMessages` so the option is findable by someone who wants the
      * feature, and `Js` so nobody enables it thinking HTML is just markup.
-     * The reason: HTML in-app messages let dashboard users run JavaScript in
-     * your app, so a maintainer has to opt in.
+     * The reason: an HTML message is dashboard-authored markup shown in a
+     * WebView that can execute script, so a maintainer has to opt in.
      *
-     * What it protects against: the server strips `<script>` and every `on*`
-     * handler before sending, so author JavaScript does not run in normal
-     * operation. The document is still rendered in a WebView that can execute
-     * script, so the residual risk is a sanitiser bypass - and because the
-     * document is authored server-side, a compromised marketing account would
-     * then mean code running in every user's session, not merely data exposure
-     * in a dashboard. Regulated apps frequently prohibit that outright.
+     * What actually happens: the server keeps the markup as written (only
+     * `<base>` and meta refresh are removed), so `<script>` and `on*`
+     * handlers reach the device - and do NOT run, because the document
+     * carries a fresh nonce Content-Security-Policy and only the SDK's
+     * bootstrap has the nonce. Buttons and forms work through that bridge
+     * (`data-joryio-action`, `data-jry-form`). The residual risk is a gap in
+     * the CSP - and because the document is authored server-side, a
+     * compromised marketing account would then mean code running in every
+     * user's session, not merely data exposure in a dashboard. Regulated apps
+     * frequently prohibit a web view outright.
      *
      * Leaving this off does NOT disable in-app messaging. Native messages still
      * display; they are data (title, body, image, buttons) rendered by this

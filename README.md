@@ -38,10 +38,10 @@ Kotlin DSL (`build.gradle.kts`):
 ```kotlin
 dependencies {
     // Everything, including in-app message display. Start here.
-    implementation("io.joryio:joryio-android-ui:1.3.0")
+    implementation("io.joryio:joryio-android-ui:1.3.1")
 
     // Or tracking/identity/push only - no in-app rendering, no WebView:
-    // implementation("io.joryio:joryio-android:1.3.0")
+    // implementation("io.joryio:joryio-android:1.3.1")
 }
 ```
 
@@ -49,7 +49,7 @@ Groovy (`build.gradle`):
 
 ```groovy
 dependencies {
-    implementation 'io.joryio:joryio-android-ui:1.3.0'
+    implementation 'io.joryio:joryio-android-ui:1.3.1'
 }
 ```
 
@@ -268,6 +268,8 @@ Joryio.initializeAsync(
 ```
 
 Leaving it off does not disable in-app messaging: native messages still display, and HTML campaigns are skipped and logged.
+
+Scripts written into an HTML message do not run: the document carries a fresh nonce Content-Security-Policy, so only the SDK's bridge script runs, and it handles buttons, `data-joryio-action` attributes and `data-jry-form` forms.
 
 An HTML message stays in its own document: any navigation it starts - a link, a refresh, a frame - is cancelled, and a link the user taps opens in the browser. Its CSS cannot close its own `<style>` element.
 

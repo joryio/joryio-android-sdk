@@ -3,6 +3,7 @@ package io.joryio.sdk.ui
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -20,6 +21,7 @@ import android.widget.FrameLayout
 import io.joryio.sdk.models.InAppCampaign
 import io.joryio.sdk.models.ButtonAction
 import io.joryio.sdk.models.InAppContent
+import io.joryio.sdk.models.InAppSizing
 import io.joryio.sdk.models.MessageType
 
 /**
@@ -32,15 +34,18 @@ import io.joryio.sdk.models.MessageType
  * placement, URL safety rules) this follows it.
  *
  * The message document is UNTRUSTED in the same sense a web page is: it is
- * authored in the dashboard, but it is arbitrary HTML/JS running inside the
- * host app. So it gets no file access, no ability to navigate the app, and it
- * reaches the SDK only through the four explicit bridge methods below.
+ * authored in the dashboard and kept as written by the server, so it may
+ * carry <script> and on* handlers. Those do not run - the nonce CSP in
+ * buildDocument lets only the SDK's bootstrap execute - and the document gets
+ * no file access, no ability to navigate the app, and reaches the SDK only
+ * through the explicit bridge methods below.
  */
 internal class InAppMessageRenderer(
     /**
-     * Whether HTML in-app messages may run. See
+     * Whether HTML in-app messages are displayed. See
      * JoryioConfig.allowHtmlJsInAppMessages - off by default, because an
-     * HTML message executes author-supplied JavaScript inside the host app.
+     * HTML message needs a JavaScript-enabled WebView inside the host app
+     * (author script in it is blocked by the CSP; only the bridge runs).
      */
     private val allowHtmlJsInAppMessages: Boolean = false,
 ) {
@@ -48,6 +53,8 @@ internal class InAppMessageRenderer(
     internal companion object {
         const val BRIDGE = "joryioBridge"
         const val DEFAULT_MODAL_MARGIN_DP = 24
+        /** Space kept on each side of a slide-up, as on iOS. */
+        const val SLIDEUP_MARGIN_DP = 12
 
         /** A navigation this soon after a tap counts as the tap's (API 23 only). */
         const val TAP_WINDOW_MS = 1_000L
@@ -64,6 +71,15 @@ internal class InAppMessageRenderer(
         /** Only a tapped http(s) link leaves the message, and only for the browser. */
         fun navigationOpensExternally(url: String, tapped: Boolean): Boolean =
             tapped && (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true))
+
+        /**
+         * The height, in px, a partial (non-fullscreen) message is given for a
+         * reported content height in CSS px: the content's height, following
+         * it DOWN as well as up, at least 1px, at most 90% of the screen
+         * (beyond that the WebView scrolls inside itself).
+         */
+        fun contentHeightPx(reportedCss: Int, density: Float, screenHeightPx: Int): Int =
+            minOf(maxOf((reportedCss * density).toInt(), 1), (screenHeightPx * 0.9).toInt())
 
         /** The document loadDataWithBaseURL(null, ...) itself. */
         fun isInitialDocument(url: String): Boolean =
@@ -111,8 +127,9 @@ internal class InAppMessageRenderer(
         }
         val html = content as InAppContent.Html
 
-        // HTML runs author-supplied JavaScript in this app's process. An app
-        // that has not opted in never reaches a WebView at all - and this is a
+        // HTML needs a JavaScript-enabled WebView in this app's process (only
+        // the SDK bridge runs; the CSP blocks author script). An app that has
+        // not opted in never reaches a WebView at all - and this is a
         // SKIP, not a failure: native campaigns keep displaying, so the channel
         // stays usable rather than becoming all-or-nothing.
         if (!allowHtmlJsInAppMessages) {
@@ -126,7 +143,7 @@ internal class InAppMessageRenderer(
         val webView = WebView(activity).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            // No filesystem or content-provider reach from message JS.
+            // No filesystem or content-provider reach from the document.
             settings.allowFileAccess = false
             settings.allowContentAccess = false
             settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -137,7 +154,8 @@ internal class InAppMessageRenderer(
 
         val dialog = Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar).apply {
             requestWindowFeature(Window.FEATURE_NO_TITLE)
-            setContentView(wrap(activity, webView, campaign.type))
+            // HTML modal / slide-up: min(maxWidth, screen - margins) wide.
+            setContentView(wrap(activity, webView, campaign.type, campaign.maxWidth))
             // Back button dismisses, like tapping the backdrop. A message the
             // user cannot escape is a trap, whatever the campaign says.
             setCancelable(true)
@@ -342,9 +360,39 @@ internal class InAppMessageRenderer(
         else -> Color.TRANSPARENT
     }
 
-    private fun wrap(activity: Activity, body: View, type: MessageType): View {
+    /**
+     * @param maxWidthDp for an HTML modal / slide-up: the widest it may be.
+     *   The body is then min(maxWidth, screen width - margins) wide, re-derived
+     *   on every measure, so a rotation or a resized window re-fits it. Before
+     *   this an HTML modal spanned a tablet edge to edge whatever the design
+     *   was authored for. Null keeps the previous full-width layout (banner,
+     *   fullscreen, and native content, which draws its own card).
+     */
+    private fun wrap(activity: Activity, body: View, type: MessageType, maxWidthDp: Int? = null): View {
         val density = activity.resources.displayMetrics.density
         val margin = (DEFAULT_MODAL_MARGIN_DP * density).toInt()
+
+        if (maxWidthDp != null && (type == MessageType.MODAL || type == MessageType.SLIDEUP)) {
+            val sideDp = if (type == MessageType.MODAL) DEFAULT_MODAL_MARGIN_DP else SLIDEUP_MARGIN_DP
+            val side = (sideDp * density).toInt()
+            return MaxWidthFrame(activity, (maxWidthDp * density).toInt(), side).apply {
+                setBackgroundColor(Color.TRANSPARENT)
+                val lp = FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    // Height tracks the content, driven by the bridge's setSize.
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    // Modal centred; slide-up in the bottom trailing corner,
+                    // as on web and iOS.
+                    gravity = if (type == MessageType.MODAL) Gravity.CENTER else Gravity.BOTTOM or Gravity.END
+                    if (type == MessageType.SLIDEUP) {
+                        marginEnd = side
+                        bottomMargin = side
+                    }
+                }
+                addView(body, lp)
+            }
+        }
 
         return FrameLayout(activity).apply {
             setBackgroundColor(Color.TRANSPARENT)
@@ -375,16 +423,17 @@ internal class InAppMessageRenderer(
      * / "desktop only" rules resolve, and (b) reports content height back so a
      * non-fullscreen message is exactly as tall as its content.
      */
-    private fun buildDocument(campaignId: String, content: InAppContent.Html, type: MessageType): String {
+    internal fun buildDocument(campaignId: String, content: InAppContent.Html, type: MessageType): String {
         val cid = jsString(campaignId)
         /*
          * A fresh, unpredictable nonce per message.
          *
-         * The server strips <script> and every on* handler before this HTML is
-         * sent, so no author JavaScript runs today. The residual risk is a
-         * sanitiser bypass, and this WebView has JavaScript enabled because the
-         * bootstrap below needs it. The nonce means only that bootstrap can
-         * execute - anything that survives sanitisation still cannot.
+         * The server keeps the author's markup as written (it drops only
+         * <base> and meta refresh), so <script> and on* handlers ARE in this
+         * document, and this WebView has JavaScript enabled because the
+         * bootstrap below needs it. The nonce is the control: only that
+         * bootstrap can execute, so nothing the author wrote runs. There is no
+         * server sanitiser in front of it.
          *
          * SecureRandom, not Random: a guessable nonce is one an attacker can
          * put on their own injected <script>, which defeats the point entirely.
@@ -403,7 +452,7 @@ internal class InAppMessageRenderer(
               /* Responsive by default - see the iOS renderer for why. Before
                  the author stylesheet, so an explicit width still wins. */
               img,video{max-width:100%;height:auto;}
-              ${if (type == MessageType.FULLSCREEN) "html,body{height:100%;}" else ""}
+              ${if (type == MessageType.FULLSCREEN) "html,body{height:100%;}" else "body{display:flow-root;}"}
             </style>
             <style>${css}</style>
             </head>
@@ -471,7 +520,11 @@ internal class InAppMessageRenderer(
                     var da = el.getAttribute('data-action');
                     var href = tag === 'A' ? el.getAttribute('href') : null;
                     window.$BRIDGE.trackClick(CID, da || (href ? 'link_click' : 'cta_click'));
-                    if (href && /^(https?:\\/\\/|\\/(?!\\/))/i.test(href)) { e.preventDefault(); window.$BRIDGE.navigate(href, el.getAttribute('target')); }
+                    // ONE backslash per escape: this is a Kotlin RAW string, so a doubled
+                    // backslash reached the page doubled, which ended the regex early - a
+                    // SyntaxError that stopped the whole bootstrap (no bridge, no setSize,
+                    // no clicks) on device.
+                    if (href && /^(https?:\/\/|\/(?!\/))/i.test(href)) { e.preventDefault(); window.$BRIDGE.navigate(href, el.getAttribute('target')); }
                     return;
                   }
                   el = el.parentNode;
@@ -513,12 +566,16 @@ internal class InAppMessageRenderer(
                 });
               }, true);
 
+              // The BODY's height (flow-root, so child margins are inside it),
+              // not the root's: the root's scrollHeight is never below the
+              // WebView's own height, so a message could grow and never shrink
+              // (a form replaced by its thank-you line kept the form's height).
+              // Same measure as the web SDK and iOS.
               function report() {
                 try {
-                  var h = Math.max(
-                    document.body ? document.body.scrollHeight : 0,
-                    document.documentElement ? document.documentElement.scrollHeight : 0
-                  );
+                  var b = document.body;
+                  if (!b) return;
+                  var h = Math.ceil(Math.max(b.scrollHeight, b.getBoundingClientRect().height));
                   if (h > 0 && native) native.setSize(CID, h);
                 } catch (e) {}
               }
@@ -585,7 +642,8 @@ internal class InAppMessageRenderer(
     // ── Bridge ──────────────────────────────────────────────────────────────
 
     /**
-     * The ONLY surface message JS can reach. Method names match the web SDK's
+     * The ONLY surface the document's script - the SDK bootstrap; the CSP
+     * blocks author script - can reach. Method names match the web SDK's
      * `joryioBridge` so a template authored once works on both.
      */
     private class Bridge(
@@ -675,11 +733,9 @@ internal class InAppMessageRenderer(
         fun setSize(cid: String, height: Int) {
             if (cid != campaignId || height <= 0 || type == MessageType.FULLSCREEN) return
             webView.post {
-                val density = webView.resources.displayMetrics.density
-                val px = (height * density).toInt()
-                val max = (webView.resources.displayMetrics.heightPixels * 0.9).toInt()
+                val metrics = webView.resources.displayMetrics
                 webView.layoutParams = webView.layoutParams?.apply {
-                    this.height = minOf(px, max)
+                    this.height = contentHeightPx(height, metrics.density, metrics.heightPixels)
                 } ?: return@post
                 webView.requestLayout()
             }
@@ -703,4 +759,27 @@ private fun toKotlin(v: Any?): Any? = when (v) {
     is org.json.JSONObject -> v.keys().asSequence().associateWith { k -> toKotlin(v.opt(k)) }
     is org.json.JSONArray -> (0 until v.length()).map { i -> toKotlin(v.opt(i)) }
     else -> v
+}
+
+/**
+ * A container whose child is min(maxWidth, own width - 2 * margin) wide.
+ *
+ * Measured, not computed once from the display metrics: the dialog's window is
+ * the real available width (split screen, a foldable, a rotation), and
+ * re-measuring follows it without any listener.
+ */
+internal class MaxWidthFrame(
+    context: Context,
+    private val maxWidthPx: Int,
+    private val marginPx: Int,
+) : FrameLayout(context) {
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val available = MeasureSpec.getSize(widthMeasureSpec)
+        val target = InAppSizing.frameWidth(maxWidthPx, available, marginPx)
+        for (i in 0 until childCount) {
+            val lp = getChildAt(i).layoutParams
+            if (lp.width != target) lp.width = target
+        }
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+    }
 }

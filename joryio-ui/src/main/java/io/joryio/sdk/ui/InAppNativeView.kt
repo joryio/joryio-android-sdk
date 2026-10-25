@@ -25,8 +25,8 @@ import io.joryio.sdk.models.MessageType
  * No WebView, and that is the whole point:
  *
  *  - **Security.** There is no interpreter, so a contact attribute containing
- *    markup is just text. Apps whose security policy forbids running authored
- *    HTML/JS in-process can use in-app messaging at all.
+ *    markup is just text. Apps whose security policy forbids rendering
+ *    authored HTML in a WebView in-process can use in-app messaging at all.
  *  - **Look.** Text renders with the app's own font scaling and dark mode, and
  *    TalkBack reads it, all for free.
  *  - **Weight.** No WebView init per message, which is a visible hitch on
