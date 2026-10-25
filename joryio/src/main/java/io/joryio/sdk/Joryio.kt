@@ -96,6 +96,45 @@ class Joryio private constructor(
     /** Captured at init like [debugEnabled]: `config` is a constructor parameter, not a property. */
     private val sendImmediately: Boolean = config.sendImmediately
     private val requestPushPermissionAtLaunch: Boolean = config.requestPushPermissionAtLaunch
+
+    /**
+     * [JoryioConfig.holdInAppMessagesForHandler]: true from initialize() until
+     * the app first sets or clears the in-app callback. While true, a message
+     * that is ready is parked in [heldForHandler] instead of being drawn.
+     * Guarded by [heldForHandler].
+     */
+    private var holdingForHandler: Boolean = config.holdInAppMessagesForHandler
+
+    /**
+     * Messages that became ready during the hold, in arrival order, each
+     * still CLAIMED (so the same campaign is not offered twice) and with
+     * nothing spent or reported. Handed to the callback when one is set, or
+     * drawn by the SDK when the app clears instead.
+     */
+    private val heldForHandler = ArrayList<HeldForHandler>()
+
+    /**
+     * A held message and WHO it was chosen for. Delivered only to that same
+     * person (anonymous id and user id unchanged) and only while fresh - a
+     * message is never handed to, or drawn for, someone else. Every identity,
+     * opt-out and consent change also drops the list outright
+     * ([dropHeldForHandler]); this check is the second line of defence.
+     */
+    private class HeldForHandler(
+        val campaign: InAppCampaign,
+        val anonymousId: String,
+        val userId: String?,
+        val heldAtMs: Long,
+    )
+
+    /**
+     * The host's hand-off while a callback is set, so a message the default
+     * route receives after the hold ended reaches the host and is never drawn
+     * by the SDK or dropped (the hold and the callback change hands on
+     * different threads).
+     */
+    @Volatile
+    private var hostHandoff: ((InAppCampaign) -> Unit)? = null
     /** One attempt per process; a refused prompt must not be re-fired every foreground. */
     private var launchPromptAttempted = false
 
@@ -1280,7 +1319,11 @@ class Joryio private constructor(
         enqueueWrite("identify", "v1/identify", request)
         // A sync in flight was asked for the previous identity: its answer is
         // discarded and a fresh sync follows it (contract item 26).
-        if (changed) inAppMessagingManager.invalidate()
+        if (changed) {
+            inAppMessagingManager.invalidate()
+            // A message held for the previous person is not this one's.
+            dropHeldForHandler()
+        }
     }
 
     /**
@@ -1361,6 +1404,7 @@ class Joryio private constructor(
             sessionManager.startNewSession()
             inAppMessagingManager.clear()
             pendingCampaign = null
+            dropHeldForHandler()
 
             // Re-associate the device token with the fresh anonymous
             // identity so a new user does not inherit the previous user's
@@ -1651,6 +1695,7 @@ class Joryio private constructor(
                     return
                 }
                 inAppMessagingManager.invalidate()
+                dropHeldForHandler()
                 if (isOptedOut) {
                     // Nothing to release; the opt-out marker may go out now.
                     scope.launch { drainOutbox(force = true) }
@@ -1664,6 +1709,7 @@ class Joryio private constructor(
                 applySendGate()
                 discardCollectedData()
                 inAppMessagingManager.invalidate()
+                dropHeldForHandler()
                 logger.info("Tracking consent denied: collecting nothing")
             }
             TrackingConsent.PENDING -> {
@@ -1675,6 +1721,7 @@ class Joryio private constructor(
                 this.consent = TrackingConsent.PENDING
                 applySendGate()
                 inAppMessagingManager.invalidate()
+                dropHeldForHandler()
                 logger.info("Tracking consent pending: holding data on the device")
             }
             null -> logger.warn("updateConsent() needs a value; ignored")
@@ -1702,6 +1749,7 @@ class Joryio private constructor(
         applySendGate()
         discardCollectedData()
         inAppMessagingManager.invalidate()
+        dropHeldForHandler()
         syncOptOutMarker()
         logger.info("User opted out of tracking")
     }
@@ -1725,6 +1773,7 @@ class Joryio private constructor(
         sessionStartDeferred = trackSessionStartEnabled
         pendingCampaign?.let { inAppMessagingManager.releaseClaim(it.id) }
         pendingCampaign = null
+        dropHeldForHandler()
         queueManager.requestClear()
         synchronized(heldPushClicks) { heldPushClicks.clear() }
     }
@@ -1743,6 +1792,7 @@ class Joryio private constructor(
         logger.info("User opted in to tracking")
         if (!isInitialized || !wasOptedOut) return
         inAppMessagingManager.invalidate()
+        dropHeldForHandler()
         if (!blocked()) scope.launch { releaseHeldWork() }
     }
 
@@ -2010,6 +2060,7 @@ class Joryio private constructor(
         inAppMessagingManager.clear()
         inAppMessagingManager.resetDisplayedCampaigns()
         pendingCampaign = null
+        dropHeldForHandler()
         sessionStartDeferred = false
         // A fresh session; the next event opens it with a Session Start.
         sessionManager.endSession()
@@ -2147,7 +2198,7 @@ class Joryio private constructor(
         // as the SDK can tell. Without this wrapper the gap would never be
         // stamped for host-rendered apps (React Native included) and every
         // eligible campaign would fire back-to-back.
-        inAppMessagingManager.onMessageReady = handoff@{ campaign ->
+        val handoff: (InAppCampaign) -> Unit = handoff@{ campaign ->
             // The frequency budget is NOT spent here (shared SDK contract
             // item 17): only a reported "displayed" spends it. Handing a
             // message over is not showing it - a host mid-cutscene may decline.
@@ -2168,7 +2219,17 @@ class Joryio private constructor(
             }
             warnIfInAppNeverReported()
         }
+        hostHandoff = handoff
+        inAppMessagingManager.onMessageReady = handoff
         hostHandlesDisplay = true
+        // Messages held for this callback (holdInAppMessagesForHandler) are
+        // the host's now, in the order they became ready, on the main thread
+        // like every other hand-off.
+        val held = endHoldForHandler()
+        if (held.isNotEmpty()) {
+            logger.info("Handing ${held.size} held in-app message(s) to your callback")
+            onMainThread { held.forEach { handoff(it) } }
+        }
     }
 
     /**
@@ -2179,9 +2240,94 @@ class Joryio private constructor(
      */
     fun clearInAppMessageCallback() {
         inAppMessagingManager.hostCapabilities = null
+        hostHandoff = null
         hostHandlesDisplay = false
-        inAppMessagingManager.onMessageReady = { campaign -> displayWithPresenter(campaign) }
+        inAppMessagingManager.onMessageReady = { campaign -> routeReadyMessage(campaign) }
+        // The app said it is not drawing: a message held for a callback
+        // (holdInAppMessagesForHandler) is drawn by the SDK now. One message
+        // at a time, as on every other route; the rest are released unspent
+        // and offered again by the next sync or trigger.
+        val held = endHoldForHandler()
+        held.firstOrNull()?.let { displayWithPresenter(it) }
+        held.drop(1).forEach { inAppMessagingManager.releaseClaim(it.id) }
     }
+
+    /**
+     * The SDK's own route for a ready message: held while the app has said it
+     * will set a callback (holdInAppMessagesForHandler), handed to the host if
+     * a callback was set meanwhile, otherwise drawn by the SDK.
+     */
+    private fun routeReadyMessage(campaign: InAppCampaign) {
+        if (holdForHandler(campaign)) return
+        val host = hostHandoff
+        if (host != null) host(campaign) else displayWithPresenter(campaign)
+    }
+
+    /** Park [campaign] for the callback; false when no hold is in force. */
+    private fun holdForHandler(campaign: InAppCampaign): Boolean {
+        val evicted: InAppCampaign?
+        synchronized(heldForHandler) {
+            if (!holdingForHandler) return false
+            if (heldForHandler.any { it.campaign.id == campaign.id }) return true
+            evicted = if (heldForHandler.size >= MAX_HELD_FOR_HANDLER) heldForHandler.removeAt(0).campaign else null
+            heldForHandler.add(
+                HeldForHandler(
+                    campaign,
+                    identityManager.getAnonymousId(),
+                    identityManager.getUserId(),
+                    System.currentTimeMillis(),
+                ),
+            )
+        }
+        // The oldest goes unspent: it is offered again by the next sync.
+        evicted?.let { inAppMessagingManager.releaseClaim(it.id) }
+        logger.info("Holding in-app message ${campaign.id} until your app sets its in-app callback (holdInAppMessagesForHandler)")
+        return true
+    }
+
+    /**
+     * End the hold for good and take what it held - only the messages chosen
+     * for the person who is current NOW and held for less than a claim's
+     * lifetime. The rest are released unspent, never delivered.
+     */
+    private fun endHoldForHandler(): List<InAppCampaign> {
+        val held = synchronized(heldForHandler) {
+            holdingForHandler = false
+            heldForHandler.toList().also { heldForHandler.clear() }
+        }
+        val anonymousId = identityManager.getAnonymousId()
+        val userId = identityManager.getUserId()
+        val now = System.currentTimeMillis()
+        val (current, stale) = held.partition {
+            it.anonymousId == anonymousId && it.userId == userId && now - it.heldAtMs < HELD_FOR_HANDLER_TTL_MS
+        }
+        stale.forEach {
+            inAppMessagingManager.releaseClaim(it.campaign.id)
+            logger.debug("Dropping held in-app message ${it.campaign.id}: chosen for another identity, or expired")
+        }
+        return current.map { it.campaign }
+    }
+
+    /**
+     * Drop what the hold parked, without ending it: the person changed
+     * (reset, wipe) or collecting stopped, so those messages are not theirs
+     * to see. Claims are released, nothing was spent.
+     */
+    private fun dropHeldForHandler() {
+        val held = synchronized(heldForHandler) {
+            heldForHandler.toList().also { heldForHandler.clear() }
+        }
+        held.forEach { inAppMessagingManager.releaseClaim(it.campaign.id) }
+    }
+
+    private fun onMainThread(block: () -> Unit) {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) block()
+        else android.os.Handler(android.os.Looper.getMainLooper()).post(block)
+    }
+
+    /** Test seam: the ids parked by holdInAppMessagesForHandler. */
+    @androidx.annotation.VisibleForTesting
+    internal fun heldForHandlerIdsForTesting(): List<String> = synchronized(heldForHandler) { heldForHandler.map { it.campaign.id } }
 
     /** Test seam: the Activity in-app messages would be drawn on. */
     @androidx.annotation.VisibleForTesting
@@ -2239,7 +2385,7 @@ class Joryio private constructor(
             },
         )
 
-        inAppMessagingManager.onMessageReady = { campaign -> displayWithPresenter(campaign) }
+        inAppMessagingManager.onMessageReady = { campaign -> routeReadyMessage(campaign) }
     }
 
     /**
@@ -2956,6 +3102,16 @@ class Joryio private constructor(
         /** Coalescing window for attribute writes; see scheduleAttributeFlush(). */
         private const val ATTRIBUTE_FLUSH_DEBOUNCE_MS = 800L
         private const val ATTRIBUTE_RETRY_BASE_MS = 2_000L
+
+        /**
+         * Most messages holdInAppMessagesForHandler parks before the callback
+         * is set. The SDK offers one per sync and one per trigger, so a few
+         * cover any real start-up; beyond it the oldest is released unspent.
+         */
+        private const val MAX_HELD_FOR_HANDLER = 5
+
+        /** A held message older than a claim's lifetime is stale: dropped, not delivered. */
+        private const val HELD_FOR_HANDLER_TTL_MS = io.joryio.sdk.messaging.CLAIM_TTL_MS
 
         /** The opt-out record on the profile. NO `$` prefix: the backend drops `$` keys (contract item 14). */
         const val TRACKING_OPTED_OUT_ATTRIBUTE = "tracking_opted_out"

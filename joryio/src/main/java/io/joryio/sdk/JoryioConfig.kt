@@ -143,6 +143,25 @@ data class JoryioConfig @JvmOverloads constructor(
      * SDK's name, in English, inside every customer's app.
      */
     val notificationChannelName: String? = "Notifications",
+
+    /**
+     * Your app draws in-app messages itself and will call
+     * [Joryio.setInAppMessageCallback] AFTER initialize(): until it does, the
+     * SDK draws nothing. Off by default.
+     *
+     * Without it there is a window between initialize() and your callback in
+     * which the first sync can finish and the SDK draws a message with its own
+     * views - the one message your app meant to draw. With it, a message that
+     * is ready before your callback is set is HELD: not drawn, not reported,
+     * nothing spent. It is handed to your callback the moment you set it.
+     * Calling [Joryio.clearInAppMessageCallback] instead ends the hold and the
+     * SDK draws the held message itself.
+     *
+     * The hold covers only the time before the first set or clear. After that,
+     * clearing the callback hands rendering back to the SDK as always.
+     * Same option, same name, on iOS (`InAppConfig`), React Native and Unity.
+     */
+    val holdInAppMessagesForHandler: Boolean = false,
 ) {
     /**
      * The level the Logger actually runs at: an explicit [logLevel] if given,
