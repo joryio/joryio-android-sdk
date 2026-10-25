@@ -167,6 +167,26 @@ data class InAppCampaign(
             }
         }
 
+    /**
+     * The widest this HTML message may be, in dp, or null when its type is not
+     * content-sized (banner, fullscreen, custom) or its content is native.
+     *
+     * The server sends the resolved value as `content.maxWidth`; a payload that
+     * predates the field gets the same per-type default every SDK uses
+     * ([InAppSizing.defaultMaxWidth]). The renderer gives the message
+     * min(maxWidth, screen width - its margins), so a design authored at 680
+     * stays 680 on a tablet instead of stretching edge to edge, and fits the
+     * screen on a phone.
+     */
+    val maxWidth: Int?
+        get() {
+            if (type != MessageType.MODAL && type != MessageType.SLIDEUP) return null
+            val c = contentPayload ?: return null
+            if (c.kind != "html") return null
+            val mw = c.maxWidth
+            return if (mw != null && mw.isFinite() && mw > 0) mw.toInt() else InAppSizing.defaultMaxWidth(type)
+        }
+
     /** Wire shape of the `content` field. */
     data class ContentPayload(
         @SerializedName("kind") val kind: String = "",
@@ -175,6 +195,8 @@ data class InAppCampaign(
         @SerializedName("html") val html: String? = null,
         @SerializedName("css") val css: String? = null,
         @SerializedName("assets") val assets: List<Map<String, Any?>>? = null,
+        /** Widest the message may be (modal / slideup); read through [InAppCampaign.maxWidth]. */
+        @SerializedName("maxWidth") val maxWidth: Double? = null,
 
         // ── kind = "native" ─────────────────────────────────────────────────
         @SerializedName("title") val title: String? = null,
@@ -207,6 +229,25 @@ data class InAppCampaign(
         @SerializedName("url") val url: String? = null,
     )
 
+}
+
+/**
+ * Sizing of content-sized (modal / slideup) HTML messages. The same numbers as
+ * the backend contract (`IN_APP_DEFAULT_MAX_WIDTH`) and every other SDK.
+ */
+object InAppSizing {
+    /** Fallback when the payload carries no `maxWidth`: modal 600, slideup 400. */
+    @JvmStatic
+    fun defaultMaxWidth(type: MessageType): Int? = when (type) {
+        MessageType.MODAL -> 600
+        MessageType.SLIDEUP -> 400
+        else -> null
+    }
+
+    /** min(maxWidth, available - margin on each side), never negative. Any one unit (px or dp). */
+    @JvmStatic
+    fun frameWidth(maxWidth: Int, available: Int, margin: Int): Int =
+        maxOf(0, minOf(maxWidth, available - 2 * margin))
 }
 
 /**
