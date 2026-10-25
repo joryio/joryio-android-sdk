@@ -38,10 +38,10 @@ Kotlin DSL (`build.gradle.kts`):
 ```kotlin
 dependencies {
     // Everything, including in-app message display. Start here.
-    implementation("io.joryio:joryio-android-ui:1.3.1")
+    implementation("io.joryio:joryio-android-ui:1.3.2")
 
     // Or tracking/identity/push only - no in-app rendering, no WebView:
-    // implementation("io.joryio:joryio-android:1.3.1")
+    // implementation("io.joryio:joryio-android:1.3.2")
 }
 ```
 
@@ -49,7 +49,7 @@ Groovy (`build.gradle`):
 
 ```groovy
 dependencies {
-    implementation 'io.joryio:joryio-android-ui:1.3.1'
+    implementation 'io.joryio:joryio-android-ui:1.3.2'
 }
 ```
 
@@ -154,6 +154,7 @@ All parameters of `JoryioConfig` are optional:
 | `enableSdkAuthentication` | `Boolean` | `false` | Attach a customer-minted JWT to every ingest request |
 | `sdkAuthenticationToken` | `String?` | `null` | Initial JWT |
 | `allowHtmlJsInAppMessages` | `Boolean` | `false` | Allow HTML in-app messages (see below) |
+| `holdInAppMessagesForHandler` | `Boolean` | `false` | Your app draws in-app messages and calls `setInAppMessageCallback` after `initialize()`: hold messages until it does (or until `clearInAppMessageCallback()`), so none is drawn by the SDK first |
 | `optOut` | `Boolean` | `false` | Start opted out of tracking (remembered, like `optOut()`) |
 | `trackingConsent` | `TrackingConsent?` | `null` (not set) | `GRANTED`, `PENDING` or `DENIED` - see [Tracking consent](#tracking-consent) |
 | `notificationChannelName` | `String` | `"Notifications"` | The notification channel name users see in system settings (Android 8+). Pass it localized |

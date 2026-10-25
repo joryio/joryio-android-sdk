@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.2 - 2026-10-25
+
+Added: `JoryioConfig.holdInAppMessagesForHandler` (off by default). An app that draws in-app messages itself and calls `setInAppMessageCallback` after `initialize()` could have the first message drawn by the SDK: the sync `initialize()` starts could finish before the callback was set. With the option on, a message that is ready before the callback is held - not drawn, not reported, nothing spent - and handed to the callback when it is set; `clearInAppMessageCallback()` instead ends the hold and the SDK draws the held message. Reset, wipe and opt-out drop a held message. A held message is bound to the person it was chosen for: identify to another user, reset, wipe, opt-out and consent changes drop it, and delivery re-checks the anonymous id, user id and age (at most 5 minutes). The same option, by the same name, on iOS, React Native and Unity.
+
 ## 1.3.1 - 2026-10-24
 
 Fixed: HTML in-app messages did not work on Android since 1.3.0. The script the SDK injects into the message page carried a link pattern with doubled backslashes, which the WebView rejected as a syntax error, so the whole bootstrap stopped: no `joryioBridge`, no height reporting, no button or link handling, no forms. The pattern is fixed and pinned by a test.
