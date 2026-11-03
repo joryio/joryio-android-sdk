@@ -469,8 +469,21 @@ internal class InAppMessagingManager(
      * Leaving the stamp alone on a failed display also makes the next sync retry
      * it, which is why no explicit pending-queue is needed here.
      */
-    internal fun noteDisplayed() {
+    internal fun noteDisplayed(): Long {
         lastDisplayAtMs = System.currentTimeMillis()
+        return lastDisplayAtMs
+    }
+
+    /** When the cross-campaign gap was last stamped (0 = never). */
+    internal fun lastDisplayAt(): Long = lastDisplayAtMs
+
+    /**
+     * Take back the gap stamped by [noteDisplayed] when the message it was for
+     * ended unseen - its screen closed within [IN_APP_DISPLAY_DWELL_MS]. Only
+     * if nothing stamped it since.
+     */
+    internal fun undoDisplayed(stamp: Long, previous: Long) {
+        if (lastDisplayAtMs == stamp) lastDisplayAtMs = previous
     }
 
     /**

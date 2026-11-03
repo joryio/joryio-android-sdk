@@ -34,6 +34,13 @@ interface InAppMessagePresenter {
      *   (`"clicked"` / `"dismissed"` / ...) and `meta` carries whatever that
      *   event has to say - the button id, a url. Passed through rather than
      *   narrowed, so adding a field to an event does not change this contract.
+     *   Send `"displayed"` once the message is on screen: it starts the display
+     *   dwell, and the SDK reports `displayed` itself only after the message
+     *   has stayed on the resumed screen for
+     *   [io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS] (or the person clicked
+     *   or dismissed it sooner). Send [EVENT_HIDDEN] when the message goes away
+     *   WITHOUT the person acting on it, so one removed within the dwell is not
+     *   counted.
      * @return true if the message was displayed. Returning false lets the
      *   caller treat it as not-shown - it must NOT count an impression for a
      *   message the user never saw, which is exactly the accounting error that
@@ -44,4 +51,13 @@ interface InAppMessagePresenter {
         campaign: InAppCampaign,
         onEvent: (action: String, meta: Map<String, Any?>) -> Unit,
     ): Boolean
+
+    companion object {
+        /**
+         * Presenter event: the message left the screen without the person
+         * acting on it (replaced, closed by the app). Never sent to the
+         * server; before the display dwell it means "not seen".
+         */
+        const val EVENT_HIDDEN = "hidden"
+    }
 }

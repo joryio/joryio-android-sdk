@@ -304,6 +304,13 @@ class Joryio private constructor(
     @Volatile
     private var pendingCampaign: InAppCampaign? = null
 
+    /**
+     * Messages the SDK drew that do not count as displayed yet: `displayed` is
+     * reported (and the frequency cap spent) only once a message has stayed on
+     * a resumed screen for [io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS].
+     */
+    private val displayDwell = io.joryio.sdk.messaging.InAppDisplayDwell()
+
     /** Sending allowed: initialized, not opted out, consent granted. */
     private fun canSend(): Boolean =
         isInitialized && !isOptedOut && consent == TrackingConsent.GRANTED
@@ -2170,7 +2177,12 @@ class Joryio private constructor(
      * spends the frequency budget (the per-campaign cap and the gap before the
      * next campaign). A message you never report reads as delivered to nobody,
      * and revenue attribution joins on that exact event. Report `displayed`
-     * once per message - the SDK does not report it for you.
+     * once per message - the SDK does not report it for you - and only once
+     * the message has been visible for
+     * [io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS] (1 second), which is
+     * the rule the SDK's own renderer follows: a message whose screen closes
+     * sooner (a sign-in redirect, a logout) was not seen and must not spend
+     * the cap. A click or dismissal sooner counts - report `displayed` first.
      *
      * Matches the same warning on iOS `setInAppMessageCallback`.
      */
@@ -2314,6 +2326,10 @@ class Joryio private constructor(
      * to see. Claims are released, nothing was spent.
      */
     private fun dropHeldForHandler() {
+        // The same holds for a message the SDK drew that has not counted as
+        // displayed yet: it was chosen for the previous person, or may no
+        // longer be reported at all - it never will be.
+        onMainThread { displayDwell.abandonAll() }
         val held = synchronized(heldForHandler) {
             heldForHandler.toList().also { heldForHandler.clear() }
         }
@@ -2328,6 +2344,14 @@ class Joryio private constructor(
     /** Test seam: the ids parked by holdInAppMessagesForHandler. */
     @androidx.annotation.VisibleForTesting
     internal fun heldForHandlerIdsForTesting(): List<String> = synchronized(heldForHandler) { heldForHandler.map { it.campaign.id } }
+
+    /** Test seam: the local impression history frequency caps count. */
+    @androidx.annotation.VisibleForTesting
+    internal fun inAppImpressionCountForTesting(campaignId: String): Int = storage.getCampaignImpressions(campaignId).size
+
+    /** Test seam: messages drawn that do not count as displayed yet. */
+    @androidx.annotation.VisibleForTesting
+    internal fun pendingDisplayIdsForTesting(): List<String> = displayDwell.pendingIds()
 
     /** Test seam: the Activity in-app messages would be drawn on. */
     @androidx.annotation.VisibleForTesting
@@ -2372,16 +2396,25 @@ class Joryio private constructor(
                     // spending the budget.
                     if (io.joryio.sdk.push.isSdkActivity(activity)) return
                     currentActivity = java.lang.ref.WeakReference(activity)
+                    // A message still on this screen from before it was paused
+                    // starts its display dwell again, in full.
+                    displayDwell.activityResumed(activity)
                     onActivityAvailable()
                 }
                 override fun onActivityPaused(activity: android.app.Activity) {
                     if (currentActivity?.get() === activity) currentActivity = null
+                    // The dwell stops while the screen is not in the foreground;
+                    // a FINISHING screen takes its unseen message with it, which
+                    // is then offered on the next screen instead.
+                    displayDwell.activityPaused(activity)
                 }
                 override fun onActivityCreated(a: android.app.Activity, b: android.os.Bundle?) {}
                 override fun onActivityStarted(a: android.app.Activity) {}
                 override fun onActivityStopped(a: android.app.Activity) {}
                 override fun onActivitySaveInstanceState(a: android.app.Activity, b: android.os.Bundle) {}
-                override fun onActivityDestroyed(a: android.app.Activity) {}
+                override fun onActivityDestroyed(a: android.app.Activity) {
+                    displayDwell.activityGone(a)
+                }
             },
         )
 
@@ -2423,17 +2456,31 @@ class Joryio private constructor(
                 inAppMessagingManager.releaseClaim(campaign.id)
                 logger.debug("No in-app presenter; not displaying ${campaign.id}")
             }
-            activity == null || activity.isFinishing -> {
-                // Common during a cold start: sync finishes before the first
-                // Activity is resumed. HELD for the next resume instead of
-                // dropped. Deliberately does NOT stamp the cross-campaign gap
-                // (see noteDisplayed) - a message nobody saw must not spend the
-                // budget.
-                logger.debug("No foreground Activity; holding ${campaign.id} for the next one")
-                pendingCampaign?.takeIf { it.id != campaign.id }?.let { inAppMessagingManager.releaseClaim(it.id) }
-                pendingCampaign = campaign
-            }
+            activity == null || !isStableForInApp(activity) -> holdForNextActivity(campaign)
             else -> activity.runOnUiThread {
+                // Re-checked on the UI thread: the screen may have started
+                // closing between the check above and now.
+                if (!isStableForInApp(activity)) {
+                    holdForNextActivity(campaign)
+                    return@runOnUiThread
+                }
+                // Drawn now, COUNTED later: `displayed` is reported only after
+                // the message has stayed on this resumed screen for
+                // IN_APP_DISPLAY_DWELL_MS (or the person interacted with it).
+                // A screen that closes first - a sign-in redirect, a logout -
+                // reports nothing and spends nothing, and the message is offered
+                // on the next screen.
+                var gapStamp = 0L
+                var gapBefore = 0L
+                val presentation = displayDwell.begin(
+                    campaign.id,
+                    activity,
+                    onConfirm = { reportInAppImpression(campaign.id, "displayed", null, displayedFirst = false) },
+                    onAbandon = { screenGone ->
+                        if (gapStamp != 0L) inAppMessagingManager.undoDisplayed(gapStamp, gapBefore)
+                        onDisplayAbandoned(campaign, screenGone)
+                    },
+                )
                 // Stamp the gap only AFTER the presenter says it drew.
                 //
                 // This used to call noteDisplayed() first and discard
@@ -2444,21 +2491,109 @@ class Joryio private constructor(
                 // Reported from a production integration, 2026-08-23.
                 val drew = try {
                     presenter.present(activity, campaign) { action, meta ->
-                        handleInAppMessageEvent(activity, campaign, action, meta)
+                        onPresenterEvent(presentation, activity, campaign, action, meta)
                     }
                 } catch (t: Throwable) {
                     logger.error("In-app presenter failed: ${t.message}", t)
                     false
                 }
                 if (drew) {
-                    inAppMessagingManager.noteDisplayed()
+                    // Stamped on draw so a second message cannot land on top of
+                    // this one during its dwell; taken back if it ends unseen.
+                    gapBefore = inAppMessagingManager.lastDisplayAt()
+                    gapStamp = inAppMessagingManager.noteDisplayed()
                 } else {
+                    // Nothing was drawn: nothing to wait for, and the claim goes.
+                    displayDwell.confirmNow(presentation)
                     inAppMessagingManager.releaseClaim(campaign.id)
                     // Deliberately leaves the gap alone: the next sync retries.
                     logger.debug("Presenter declined to draw ${campaign.id}; gap not stamped")
                 }
             }
         }
+    }
+
+    /**
+     * Whether [activity] is a screen an in-app message can be shown on and
+     * seen: the resumed one, not finishing, not destroyed and not being
+     * recreated (a rotation). A message drawn on a screen in the middle of
+     * closing vanishes with it.
+     */
+    private fun isStableForInApp(activity: android.app.Activity): Boolean =
+        currentActivity?.get() === activity &&
+            !activity.isFinishing &&
+            !activity.isDestroyed &&
+            !activity.isChangingConfigurations
+
+    /**
+     * No screen to show [campaign] on right now: common during a cold start
+     * (sync finishes before the first Activity is resumed) and during a screen
+     * change. HELD for the next resume instead of dropped. Deliberately does
+     * NOT stamp the cross-campaign gap (see noteDisplayed) - a message nobody
+     * saw must not spend the budget.
+     */
+    private fun holdForNextActivity(campaign: InAppCampaign) {
+        logger.debug("No stable foreground Activity; holding ${campaign.id} for the next one")
+        pendingCampaign?.takeIf { it.id != campaign.id }?.let { inAppMessagingManager.releaseClaim(it.id) }
+        pendingCampaign = campaign
+    }
+
+    /**
+     * A message the SDK drew ended before it counted as displayed. Nothing was
+     * reported and nothing spent. When its SCREEN went away (finished,
+     * destroyed) it is offered on the next one, holding its claim; when it was
+     * removed or the person changed, the claim is released.
+     */
+    private fun onDisplayAbandoned(campaign: InAppCampaign, screenGone: Boolean) {
+        logger.debug("In-app message ${campaign.id} closed before ${io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS} ms on screen; not counted as displayed")
+        if (!screenGone || hostHandlesDisplay || !canSend()) {
+            inAppMessagingManager.releaseClaim(campaign.id)
+            return
+        }
+        val next = currentActivity?.get()
+        if (next != null && isStableForInApp(next)) {
+            onMainThread { displayWithPresenter(campaign) }
+        } else {
+            holdForNextActivity(campaign)
+        }
+    }
+
+    /**
+     * What the presenter reports for a message the SDK drew, run through the
+     * display dwell before it reaches [handleInAppMessageEvent].
+     */
+    private fun onPresenterEvent(
+        presentation: io.joryio.sdk.messaging.InAppDisplayDwell.Presentation,
+        activity: android.app.Activity,
+        campaign: InAppCampaign,
+        action: String,
+        meta: Map<String, Any?>,
+    ) {
+        when (action) {
+            // On screen: the dwell starts (now, or when the screen resumes).
+            "displayed" -> {
+                displayDwell.shown(presentation, foreground = isStableForInApp(activity))
+                return
+            }
+            // Removed without the person acting on it (replaced by another
+            // message, closed by the app): before the dwell, it was not seen.
+            InAppMessagePresenter.EVENT_HIDDEN -> {
+                displayDwell.abandon(presentation, screenGone = false)
+                return
+            }
+        }
+        val interaction = action in SEEN_BY_INTERACTION ||
+            io.joryio.sdk.messaging.canonicalInAppAction(action) in setOf("clicked", "dismissed", "converted")
+        if (interaction && presentation.state == io.joryio.sdk.messaging.InAppDisplayDwell.State.ABANDONED) {
+            // Ended unseen (the person changed, sending stopped): the slot was
+            // released then, and nothing about it is reported now.
+            logger.debug("In-app message ${campaign.id} no longer counts; '$action' not reported")
+            return
+        }
+        // A click or a dismissal before the dwell: the person saw it.
+        // `displayed` is reported first, then the interaction.
+        val displayedFirst = interaction && displayDwell.confirmNow(presentation)
+        handleInAppMessageEvent(activity, campaign, action, meta, displayedFirst)
     }
 
     /**
@@ -2493,7 +2628,13 @@ class Joryio private constructor(
         campaign: io.joryio.sdk.models.InAppCampaign,
         action: String,
         meta: Map<String, Any?>,
+        displayedFirst: Boolean = false,
     ) {
+        // An interaction that is not itself an impression (a form, the push
+        // prompt) still proves the message was seen: `displayed` goes first.
+        if (displayedFirst && action in SEEN_BY_INTERACTION) {
+            reportInAppImpression(campaign.id, "displayed", null, displayedFirst = false)
+        }
         when (action) {
             "custom_event" -> {
                 val name = meta["name"] as? String ?: return
@@ -2519,8 +2660,8 @@ class Joryio private constructor(
             }
             // A click keeps the name the message gave it (data-action, logClick, a
             // native button id); it used to be dropped here with the whole meta map.
-            "clicked" -> trackInAppImpression(campaign.id, action, meta["action"] as? String)
-            else -> trackInAppImpression(campaign.id, action)
+            "clicked" -> reportInAppImpression(campaign.id, action, meta["action"] as? String, displayedFirst)
+            else -> reportInAppImpression(campaign.id, action, null, displayedFirst && action !in SEEN_BY_INTERACTION)
         }
     }
 
@@ -2571,14 +2712,25 @@ class Joryio private constructor(
      * @param action displayed, clicked, dismissed or converted (the backend's
      *   vocabulary; synonyms such as `impression` or `click` are accepted and
      *   sent as the canonical word). Only `displayed` counts toward frequency
-     *   caps.
+     *   caps: report it once the message has been visible for
+     *   [io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS], or just before a
+     *   click or dismissal that comes sooner.
      * @param elementId for a click, which button or link (wire field `elementId`, max 128).
      */
     // @JvmOverloads keeps the two-argument form for Java callers (the Unity
     // bridge is Java); the click NAME was added 2026-09-26 with a Kotlin
     // default, which Java cannot see.
     @JvmOverloads
-    fun trackInAppImpression(campaignId: String?, action: String?, elementId: String? = null) {
+    fun trackInAppImpression(campaignId: String?, action: String?, elementId: String? = null) =
+        reportInAppImpression(campaignId, action, elementId, displayedFirst = false)
+
+    /**
+     * [trackInAppImpression], optionally preceded by `displayed` for the same
+     * message IN ONE coroutine - so the server receives the display before
+     * the click or dismissal that proved it (the dwell rule: an interaction
+     * before [io.joryio.sdk.messaging.IN_APP_DISPLAY_DWELL_MS] counts as seen).
+     */
+    private fun reportInAppImpression(campaignId: String?, action: String?, elementId: String?, displayedFirst: Boolean) {
         // A dismissed message frees its display claim even when nothing may
         // be SENT (contract item 43; scan 4, M3). The release sat behind the
         // send gate, so a message closed while consent was pending or after
@@ -2601,6 +2753,7 @@ class Joryio private constructor(
         }
         inAppReported++
         scope.launch {
+            if (displayedFirst) inAppMessagingManager.trackImpression(campaignId, "displayed")
             inAppMessagingManager.trackImpression(campaignId, action, elementId)
         }
     }
@@ -3837,3 +3990,9 @@ class Joryio private constructor(
     }
 }
 
+/**
+ * Presenter events that are not impressions but prove the person saw the
+ * message (a form submitted, the push prompt asked for): before the display
+ * dwell they report `displayed` first, like a click or a dismissal.
+ */
+private val SEEN_BY_INTERACTION = setOf("form_submit", "push_permission")

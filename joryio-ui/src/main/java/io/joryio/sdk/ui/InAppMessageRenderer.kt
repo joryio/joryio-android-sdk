@@ -18,6 +18,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import io.joryio.sdk.InAppMessagePresenter
 import io.joryio.sdk.models.InAppCampaign
 import io.joryio.sdk.models.ButtonAction
 import io.joryio.sdk.models.InAppContent
@@ -160,6 +161,10 @@ internal class InAppMessageRenderer(
             // user cannot escape is a trap, whatever the campaign says.
             setCancelable(true)
             setOnCancelListener { onEvent("dismissed", mapOf("reason" to "back")) }
+            // Any way the dialog goes (replaced by the next message included).
+            // Delivered after a user's "dismissed", so the SDK reads it as
+            // "removed unseen" only when nobody acted on the message.
+            setOnDismissListener { onEvent(InAppMessagePresenter.EVENT_HIDDEN, emptyMap()) }
             window?.apply {
                 setBackgroundDrawable(ColorDrawable(backdropColor(campaign.type)))
                 setLayout(
@@ -259,6 +264,8 @@ internal class InAppMessageRenderer(
         current?.dismiss()
         current = dialog
         dialog.show()
+        // On screen - not yet COUNTED: the base SDK reports `displayed` after
+        // IN_APP_DISPLAY_DWELL_MS on a resumed screen, or at a click/dismissal.
         onEvent("displayed", emptyMap())
         return true
     }
@@ -323,6 +330,10 @@ internal class InAppMessageRenderer(
             setCancelable(true)
             setCanceledOnTouchOutside(content.backdropDismissible)
             setOnCancelListener { onEvent("dismissed", mapOf("reason" to "back")) }
+            // Any way the dialog goes (replaced by the next message included).
+            // Delivered after a user's "dismissed", so the SDK reads it as
+            // "removed unseen" only when nobody acted on the message.
+            setOnDismissListener { onEvent(InAppMessagePresenter.EVENT_HIDDEN, emptyMap()) }
             window?.apply {
                 setBackgroundDrawable(ColorDrawable(backdropColor(campaign.type)))
                 setLayout(
@@ -337,6 +348,8 @@ internal class InAppMessageRenderer(
         current?.dismiss()
         current = d
         d.show()
+        // On screen - not yet COUNTED: the base SDK reports `displayed` after
+        // IN_APP_DISPLAY_DWELL_MS on a resumed screen, or at a click/dismissal.
         onEvent("displayed", emptyMap())
         return true
     }
