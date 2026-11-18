@@ -38,10 +38,10 @@ Kotlin DSL (`build.gradle.kts`):
 ```kotlin
 dependencies {
     // Everything, including in-app message display. Start here.
-    implementation("io.joryio:joryio-android-ui:1.3.3")
+    implementation("io.joryio:joryio-android-ui:1.4.0")
 
     // Or tracking/identity/push only - no in-app rendering, no WebView:
-    // implementation("io.joryio:joryio-android:1.3.3")
+    // implementation("io.joryio:joryio-android:1.4.0")
 }
 ```
 
@@ -49,7 +49,7 @@ Groovy (`build.gradle`):
 
 ```groovy
 dependencies {
-    implementation 'io.joryio:joryio-android-ui:1.3.3'
+    implementation 'io.joryio:joryio-android-ui:1.4.0'
 }
 ```
 
@@ -321,6 +321,24 @@ Joryio.removeFromSubscriptionGroup("list_abc123", "email")
 ```
 
 Channels: `email`, `sms`, `whatsapp`, `push`, `viber`. Statuses: `optedIn`, `subscribed`, `unsubscribed`.
+
+## Recognise people who click your messages
+
+A tracked link in a Joryio message carries a `jr_t` token. When that link opens your app (an App Link or a deep link), pass the URL to the SDK and the visits and events from this device are attributed to the contact the message was sent to (attribution only - nothing is written to that contact's profile, and the device is not signed in as them):
+
+```kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    Joryio.identifyFromLink(intent?.data)
+}
+
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    Joryio.identifyFromLink(intent.data)
+}
+```
+
+`identifyFromLink` takes a `Uri` or a `String`, and is safe before `initialize()`. A URL without `jr_t` does nothing, so you can pass every URL your app opens. The SDK acts only when tracking is allowed and nobody is identified on the device: a signed-in user is never re-attached by a link, an opt-out or a denied consent drops the token, and while consent is pending the token is kept in memory and sent once consent is granted. It is never stored on the device.
 
 ## Privacy controls
 

@@ -83,7 +83,7 @@ internal class IdentityManager(
      * A caller-supplied anonymous id (JoryioConfig.anonymousId) is dropped too:
      * it identified the outgoing session, not the device.
      */
-    fun reset() {
+    fun reset(anonymousId: String? = null) {
         // Drop un-acked writes for the OUTGOING user - sending them after a
         // reset would attribute one person's traits to the next.
         pending.clear()
@@ -93,7 +93,8 @@ internal class IdentityManager(
         attributes.clear()
         storage.clearUserAttributes()
         suppliedAnonymousId = null
-        storage.setAnonymousId(java.util.UUID.randomUUID().toString())
+        // resetTo(): the caller's id (validated by Joryio.resetTo), else a new random one.
+        storage.setAnonymousId(anonymousId ?: java.util.UUID.randomUUID().toString())
     }
 
     // MARK: - User Attributes (in-memory only — never persisted)

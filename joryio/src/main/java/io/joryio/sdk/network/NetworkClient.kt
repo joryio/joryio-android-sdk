@@ -704,6 +704,13 @@ internal class NetworkClient(
         }
     }
 
+    /** Click-link identity. 4xx is never retried; 5xx gets the normal retry (executeWithRetry). */
+    suspend fun identifyLink(request: IdentifyLinkRequest): NetworkResult<IdentifyLinkResponse> {
+        return executeWithRetry("identifyLink") {
+            api.identifyLink(request)
+        }
+    }
+
     suspend fun addAlias(request: AddAliasRequest): NetworkResult<AliasResponse> {
         return executeWithRetry("addAlias") {
             api.addAlias(request)

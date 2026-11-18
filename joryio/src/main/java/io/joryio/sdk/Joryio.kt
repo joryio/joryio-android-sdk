@@ -411,6 +411,20 @@ class Joryio private constructor(
      */
     private val heldPushClicks = ArrayDeque<String>()
 
+    /**
+     * Click-link tokens (`jr_t`) this process has accepted - sent or held -
+     * so the same link handed in twice (onCreate and onNewIntent, say) is
+     * sent once. Memory only: a token is never persisted. Guarded by itself.
+     */
+    private val acceptedLinkTokens = HashSet<String>()
+
+    /**
+     * Click-link tokens held while consent is PENDING - in memory only, never
+     * on disk; sent on GRANTED, dropped on DENIED, an opt-out or a reset().
+     * Guarded by [acceptedLinkTokens].
+     */
+    private val heldLinkTokens = ArrayDeque<String>()
+
     private fun addToOutbox(kind: String, path: String, request: Any, key: String? = null, alsoReplaces: String? = null) {
         val body = try {
             io.joryio.sdk.network.WireJson.gson.toJson(request)
@@ -1379,7 +1393,59 @@ class Joryio private constructor(
      * the new identity. It used to run inside a coroutine, and the anonymous
      * id survived it.
      */
-    fun reset() {
+    fun reset() = resetIdentity(null)
+
+    /**
+     * [reset], then adopt [anonymousId] instead of a new random id (BACKLOG
+     * D366). For a host that keeps its own visitor id, so the SDK and the
+     * host stay ONE visitor after a logout.
+     *
+     * Everything [reset] does happens. The id must be 8 to 255 letters,
+     * digits, `.`, `_`, `:` or `-` ([ResetTo.ANONYMOUS_ID_PATTERN]), must not
+     * have the shape of a Joryio profile id (24 lowercase hex) and must not be
+     * the user id this SDK holds (signed in, or kept for withdrawals), nor the
+     * anonymous id it holds while a user is signed in (that id is tied to the
+     * signed-in user's profile). A refused id is logged and the call is a
+     * plain [reset] - a random id - so a logout is never skipped. The same
+     * rule on all five SDKs.
+     *
+     * [onResult] gets `true` when the id was adopted, `false` when it was
+     * refused (a random id was used) or the SDK is not initialized. It runs
+     * once, when the call runs: for a call held before initialize(), after
+     * initialize(); a held call discarded before then never answers.
+     *
+     * An anonymous id is a claim, not a credential: whoever holds one already
+     * tied to an identified profile is treated as that visitor, unless SDK
+     * Authentication is on (anonymous writes to an identified profile are
+     * then refused). Adopt only ids your own app issued for this device.
+     */
+    fun resetTo(anonymousId: String?, onResult: ((Boolean) -> Unit)? = null) {
+        if (!isInitialized) {
+            logger.warn("SDK not initialized, cannot reset")
+            answerResetTo(onResult, false)
+            return
+        }
+        val userId = identityManager.getUserId()
+        val refusal = ResetTo.refusal(
+            anonymousId,
+            listOf(userId, storage.getHeldUserId()),
+            if (userId != null) identityManager.getAnonymousId() else null,
+            storage.getSignedInAnonymousIds(),
+        )
+        if (refusal != null) logger.error("$refusal; a random anonymous id is used instead")
+        resetIdentity(if (refusal == null) anonymousId else null)
+        answerResetTo(onResult, refusal == null)
+    }
+
+    private fun answerResetTo(onResult: ((Boolean) -> Unit)?, adopted: Boolean) {
+        try {
+            onResult?.invoke(adopted)
+        } catch (t: Throwable) {
+            logger.error("resetTo callback threw: ${t.message}", t)
+        }
+    }
+
+    private fun resetIdentity(anonymousId: String?) {
         if (!isInitialized) {
             logger.warn("SDK not initialized, cannot reset")
             return
@@ -1397,11 +1463,17 @@ class Joryio private constructor(
             // last events got a 401 and were dropped. It stays bound to them.
             // Never standby when it is the signed-in user's own (contract v9 89).
             networkClient.retireSdkAuthenticationToken(withdrawalUserId(), identityManager.getUserId())
+            // The outgoing user's anonymous id is tied to their profile: a
+            // later resetTo() must never hand it to someone else (D366).
+            if (identityManager.getUserId() != null) storage.rememberSignedInAnonymousId(identityManager.getAnonymousId())
             synchronized(identityLock) {
                 identityGeneration++
-                identityManager.reset()
+                identityManager.reset(anonymousId)
             }
             storage.setHeldUserId(null)
+            // A click-link token held for the outgoing visitor is not the
+            // next one's: it would attach the new anonymous id to them.
+            synchronized(acceptedLinkTokens) { heldLinkTokens.clear() }
             // Attribute ops of the outgoing person are dropped with their
             // pending writes (contract item 6). Identify, aliases and
             // subscription changes stay: they carry the outgoing ids and are
@@ -1783,6 +1855,7 @@ class Joryio private constructor(
         dropHeldForHandler()
         queueManager.requestClear()
         synchronized(heldPushClicks) { heldPushClicks.clear() }
+        synchronized(acceptedLinkTokens) { heldLinkTokens.clear() }
     }
 
     /**
@@ -1826,6 +1899,7 @@ class Joryio private constructor(
         flushPendingAttributes()
         queueManager.flush(force = true)
         releaseHeldPushClicks()
+        releaseHeldLinkTokens()
         inAppMessagingManager.sync()
         try {
             pushManager?.bootstrapToken()
@@ -2656,7 +2730,7 @@ class Joryio private constructor(
                 val values = (meta["values"] as? Map<String, Any?>) ?: emptyMap()
                 @Suppress("UNCHECKED_CAST")
                 val respond = meta["respond"] as? (String) -> Unit
-                submitInAppForm(campaign.id, values) { json -> respond?.invoke(json) }
+                submitInAppFormWithToken(campaign.id, values, campaign.formToken) { json -> respond?.invoke(json) }
             }
             // A click keeps the name the message gave it (data-action, logClick, a
             // native button id); it used to be dropped here with the whole meta map.
@@ -2672,7 +2746,15 @@ class Joryio private constructor(
      * or an opted-out / not-yet-consented user, for whom this write is refused -
      * becomes an `ok: false` answer.
      */
-    fun submitInAppForm(campaignId: String?, values: Map<String, Any?>?, onResult: ((String) -> Unit)?) {
+    fun submitInAppForm(campaignId: String?, values: Map<String, Any?>?, onResult: ((String) -> Unit)?) =
+        submitInAppFormWithToken(campaignId, values, null, onResult)
+
+    /**
+     * [formToken]: the one the displayed campaign carries; null looks it up by
+     * campaign id (a host-rendered message, Unity, React Native). Sent so the
+     * server can take campaign, variant and form from it (BACKLOG D371 item 4).
+     */
+    internal fun submitInAppFormWithToken(campaignId: String?, values: Map<String, Any?>?, formToken: String?, onResult: ((String) -> Unit)?) {
         val gson = io.joryio.sdk.network.WireJson.gson
         val fallback = gson.toJson(io.joryio.sdk.models.InAppFormSubmitResponse(ok = false, message = "Something went wrong. Please try again."))
         if (campaignId.isNullOrBlank() || !canSend()) {
@@ -2688,6 +2770,7 @@ class Joryio private constructor(
             campaignId = campaignId,
             userId = identityManager.getUserId(),
             anonymousId = identityManager.getAnonymousId(),
+            formToken = formToken ?: inAppMessagingManager.formTokenFor(campaignId),
             values = values ?: emptyMap(),
         )
         scope.launch {
@@ -3136,6 +3219,93 @@ class Joryio private constructor(
         }
     }
 
+    // MARK: - Click-link identity
+
+    /**
+     * Recognise the person who clicked a tracked link in a Joryio message.
+     *
+     * Pass the URL that opened the app (an app link / deep link: the
+     * Activity's `intent.data` in onCreate and onNewIntent). When it carries
+     * the `jr_t` token the click redirect added, this visitor is attached to
+     * the contact the message was sent to. Fire-and-forget; a URL without a
+     * well-formed `jr_t` does nothing.
+     *
+     * - Already identified (identify() / a userId): nothing - a link never
+     *   overrides a stronger identity (the server enforces this too).
+     * - Opted out or consent DENIED: the token is dropped.
+     * - Consent PENDING: held in memory only and sent on GRANTED.
+     * - The same token twice in one process: sent once.
+     *
+     * The token is never persisted, and never logged above debug.
+     */
+    fun identifyFromLink(url: String?) {
+        val token = ClickIdentity.tokenFrom(url) ?: return
+        if (!isInitialized) {
+            // The static Joryio.identifyFromLink() holds a pre-init call until
+            // initialize(); an instance in no-send mode never sends.
+            logger.debug("SDK not initialized: click-link token ignored")
+            return
+        }
+        if (blocked()) {
+            logger.debug("Opted out or consent denied: click-link token dropped")
+            return
+        }
+        if (identityManager.getUserId() != null) {
+            logger.debug("Already identified: click-link token ignored")
+            return
+        }
+        val sendNow = synchronized(acceptedLinkTokens) {
+            if (!acceptedLinkTokens.add(token)) {
+                logger.debug("Click-link token already handled in this process")
+                return
+            }
+            if (canSend()) {
+                true
+            } else {
+                // Consent PENDING: memory only, released on GRANTED.
+                if (heldLinkTokens.size >= ClickIdentity.MAX_HELD_TOKENS) heldLinkTokens.removeFirst()
+                heldLinkTokens.addLast(token)
+                false
+            }
+        }
+        if (sendNow) {
+            sendLinkToken(token)
+        } else {
+            logger.debug("Consent pending: click-link token held in memory until a decision")
+        }
+    }
+
+    /** [identifyFromLink] for an [android.net.Uri] - the Activity's `intent.data`. */
+    fun identifyFromLink(uri: android.net.Uri?) = identifyFromLink(uri?.toString())
+
+    private fun releaseHeldLinkTokens() {
+        val tokens = synchronized(acceptedLinkTokens) { heldLinkTokens.toList().also { heldLinkTokens.clear() } }
+        if (tokens.isEmpty()) return
+        // Identified while consent was pending: the stronger identity wins.
+        if (!canSend() || identityManager.getUserId() != null) return
+        tokens.forEach { sendLinkToken(it) }
+    }
+
+    private fun sendLinkToken(token: String) {
+        val request = io.joryio.sdk.network.IdentifyLinkRequest(
+            token = token,
+            anonymousId = identityManager.getAnonymousId(),
+        )
+        scope.launch {
+            try {
+                // Best-effort: a 4xx is final, a 5xx / network error gets the
+                // client's normal retry and is then dropped. Nothing in the
+                // answer changes what the SDK does ("ok" and "ignored" alike).
+                when (val result = networkClient.identifyLink(request)) {
+                    is NetworkResult.Success -> logger.debug("Click-link identity sent")
+                    is NetworkResult.Error -> logger.debug("Click-link identity not sent: ${result.message}")
+                }
+            } catch (e: Exception) {
+                logger.debug("Click-link identity failed: ${e.message}")
+            }
+        }
+    }
+
     // MARK: - SDK Authentication
 
     /**
@@ -3470,10 +3640,13 @@ class Joryio private constructor(
                 // The SDK-auth token and handler are configuration, not data:
                 // kept (scan 6, Android NICE 4), so the withdrawals replayed
                 // before the wipe go out with the token set for them.
-                synchronized(pendingActions) {
+                val dropped = synchronized(pendingActions) {
+                    val gone = pendingActions.filter { !it.withdrawal && !it.keepThroughWipe }
                     pendingActions.removeAll { !it.withdrawal && !it.keepThroughWipe }
                     preWipeActionCount = pendingActions.size
+                    gone
                 }
+                settleDropped(dropped)
                 return
             }
             withSdk { it.wipeData() }
@@ -3607,7 +3780,24 @@ class Joryio private constructor(
             val unregistersPush: Boolean = false,
             /** A call that COLLECTS (see [withData]): a later pre-init optOut() or denial drops it. */
             val data: Boolean = false,
+            /**
+             * Answers a caller-visible callback when the call is discarded
+             * before it runs (resetTo: `false`), so an awaiting host never
+             * hangs. Called outside the buffer lock, at most once.
+             */
+            val onDropped: (() -> Unit)? = null,
         )
+
+        /** Tell each discarded call (outside any lock). */
+        private fun settleDropped(dropped: List<PendingAction>) {
+            dropped.forEach { action ->
+                try {
+                    action.onDropped?.invoke()
+                } catch (t: Throwable) {
+                    android.util.Log.w("Joryio", "A dropped call's callback threw: ${t.message}")
+                }
+            }
+        }
 
         /**
          * A pre-init optOut() / updateConsent(DENIED): the data calls buffered
@@ -3619,6 +3809,7 @@ class Joryio private constructor(
          * and every other control call are kept.
          */
         private fun purgeBufferedDataCalls() {
+            val dropped = mutableListOf<PendingAction>()
             synchronized(pendingActions) {
                 var index = 0
                 var removedBeforeWipe = 0
@@ -3628,11 +3819,13 @@ class Joryio private constructor(
                     if (action.data) {
                         if (index < preWipeActionCount) removedBeforeWipe++
                         iterator.remove()
+                        dropped.add(action)
                     }
                     index++
                 }
                 preWipeActionCount -= removedBeforeWipe
             }
+            settleDropped(dropped)
         }
 
         /**
@@ -3773,8 +3966,10 @@ class Joryio private constructor(
             keepThroughWipe: Boolean = false,
             unregistersPush: Boolean = false,
             data: Boolean = false,
+            onDropped: (() -> Unit)? = null,
             action: (Joryio) -> Unit,
         ) {
+            var evicted: PendingAction? = null
             val sdk = synchronized(pendingActions) {
                 val ready = instance
                 if (ready == null || !drained) {
@@ -3782,17 +3977,21 @@ class Joryio private constructor(
                         val victim = pendingActions.firstOrNull { !it.withdrawal } ?: pendingActions.first()
                         if (pendingActions.indexOf(victim) < preWipeActionCount) preWipeActionCount--
                         pendingActions.remove(victim)
+                        evicted = victim
                         android.util.Log.w(
                             "Joryio",
                             "Dropping the oldest pre-initialization call: more than " +
                                 "$MAX_PENDING_ACTIONS were made before initialize() completed.",
                         )
                     }
-                    pendingActions.addLast(PendingAction(withdrawal, action, keepThroughWipe, unregistersPush, data))
-                    return
+                    pendingActions.addLast(PendingAction(withdrawal, action, keepThroughWipe, unregistersPush, data, onDropped))
+                    null
+                } else {
+                    ready
                 }
-                ready
             }
+            evicted?.let { settleDropped(listOf(it)) }
+            if (sdk == null) return
             try {
                 action(sdk)
             } catch (t: Throwable) {
@@ -3852,6 +4051,8 @@ class Joryio private constructor(
         /** Test seam: forget the singleton and the buffer. */
         @androidx.annotation.VisibleForTesting
         internal fun resetForTesting() {
+            val dropped = synchronized(pendingActions) { pendingActions.toList() }
+            settleDropped(dropped)
             synchronized(pendingActions) {
                 pendingActions.clear()
                 preWipeActionCount = 0
@@ -3919,9 +4120,32 @@ class Joryio private constructor(
             withData { it.addAlias(label, name) }
         }
 
+        /**
+         * [Joryio.identifyFromLink] on the shared instance. Before
+         * initialize() a URL carrying a well-formed `jr_t` is held in memory
+         * (the pre-init buffer, never on disk) and handled at init; dropped if
+         * the person opts out or consent is denied first, like other data calls.
+         */
+        fun identifyFromLink(url: String?) {
+            if (ClickIdentity.tokenFrom(url) == null) return
+            withData { it.identifyFromLink(url) }
+        }
+
+        /** [identifyFromLink] for an [android.net.Uri] - the Activity's `intent.data`. */
+        fun identifyFromLink(uri: android.net.Uri?) = identifyFromLink(uri?.toString())
+
         fun reset() {
             notePreInitIdentityCall()
             withSdk { it.reset() }
+        }
+
+        /** [Joryio.resetTo] on the shared instance; held until initialize() like [reset]. */
+        fun resetTo(anonymousId: String?, onResult: ((Boolean) -> Unit)? = null) {
+            notePreInitIdentityCall()
+            // Exactly once: the run answers true / false, a discarded held call false.
+            val answered = java.util.concurrent.atomic.AtomicBoolean(false)
+            val once: ((Boolean) -> Unit)? = onResult?.let { cb -> { v: Boolean -> if (answered.compareAndSet(false, true)) cb(v) } }
+            withSdk(onDropped = once?.let { { it(false) } }) { it.resetTo(anonymousId, once) }
         }
 
         fun setAttribute(key: String?, value: Any?) {

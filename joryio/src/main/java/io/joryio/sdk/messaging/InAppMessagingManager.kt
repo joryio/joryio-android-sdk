@@ -148,6 +148,24 @@ internal class InAppMessagingManager(
         if (isSyncing.get()) syncAgainRequested = true
     }
 
+    /**
+     * Form tokens of messages handed to the presenter or a host handler, by
+     * campaign id. A re-check campaign gets its token from the display-time
+     * resolve, which is not in [campaigns].
+     */
+    private val presentedFormTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * The form token the server served with this campaign (BACKLOG D371 item
+     * 4), for the form submit: the presented copy first, else the synced one.
+     */
+    internal fun rememberFormToken(campaign: InAppCampaign) {
+        campaign.formToken?.let { presentedFormTokens[campaign.id] = it }
+    }
+
+    fun formTokenFor(campaignId: String): String? =
+        presentedFormTokens[campaignId] ?: campaigns.firstOrNull { it.id == campaignId }?.formToken
+
     suspend fun sync() {
         if (!canSend()) {
             logger.debug("In-app sync skipped: consent pending or opted out")
@@ -431,6 +449,7 @@ internal class InAppMessagingManager(
     /** Hand a campaign (already resolved, if it needed it) to the presenter. */
     private fun presentResolved(campaign: InAppCampaign) {
         logger.info("Displaying campaign: ${campaign.name}")
+        rememberFormToken(campaign)
 
         val delaySeconds = campaign.delay ?: 0
         if (delaySeconds > 0) {
@@ -790,6 +809,10 @@ internal class InAppMessagingManager(
      */
     fun clear() {
         invalidate()
+        // reset() / wipeData(): the served form tokens belong to the visitor
+        // that is going away. NOT on identify: the anonymousId stays, the
+        // server accepts the token for it, and every SDK keeps it there.
+        presentedFormTokens.clear()
         scope.coroutineContext.cancelChildren()
         synchronized(claims) { claims.clear() }
         campaigns = emptyList()

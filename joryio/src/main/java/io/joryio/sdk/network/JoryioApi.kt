@@ -40,6 +40,16 @@ internal interface JoryioApi {
     ): Response<IdentifyResponse>
 
     /**
+     * Click-link identity: attach this anonymous visitor to the contact a
+     * tracked message link was sent to (the `jr_t` token). Same base URL,
+     * headers and SDK-key auth as `v1/identify`. See core/ClickIdentity.kt.
+     */
+    @POST("v1/identify-link")
+    suspend fun identifyLink(
+        @Body request: IdentifyLinkRequest
+    ): Response<IdentifyLinkResponse>
+
+    /**
      * Attach a labelled identifier (a loyalty number, a CRM id) to this person.
      *
      * Works for anonymous visitors too (shared SDK contract item 2): the
@@ -205,6 +215,21 @@ internal data class IdentifyRequest(
     @SerializedName("anonymousId") val anonymousId: String,
     @SerializedName("attributes") val attributes: Map<String, Any?>? = null,
     @SerializedName("timestamp") val timestamp: java.util.Date = java.util.Date()
+)
+
+/**
+ * Body of POST /v1/identify-link: exactly these two keys, on every SDK.
+ * `token` is the `jr_t` value - held in memory only, never persisted or logged.
+ */
+internal data class IdentifyLinkRequest(
+    @SerializedName("token") val token: String,
+    @SerializedName("anonymousId") val anonymousId: String,
+)
+
+/** `status` is "ok" or "ignored"; the SDK acts the same on both. */
+internal data class IdentifyLinkResponse(
+    @SerializedName("success") val success: Boolean? = null,
+    @SerializedName("status") val status: String? = null,
 )
 
 /**

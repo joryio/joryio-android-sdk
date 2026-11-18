@@ -331,6 +331,7 @@ internal class StorageManager(
         private const val KEY_PENDING_UNREGISTER = "pending_unregister"
         private const val KEY_RETIRED_AUTH_TOKENS = "retired_sdk_auth_tokens"
         private const val KEY_HELD_USER_ID = "held_user_id"
+        private const val KEY_SIGNED_IN_ANONYMOUS_IDS = "signed_in_anonymous_ids"
     }
 
     // MARK: - Retired SDK-auth tokens (owner decision D-a)
@@ -361,6 +362,26 @@ internal class StorageManager(
     fun setHeldUserId(userId: String?) {
         if (userId == null) prefs.edit().remove(KEY_HELD_USER_ID).apply()
         else prefs.edit().putString(KEY_HELD_USER_ID, userId).apply()
+    }
+
+    /**
+     * Anonymous ids that were tied to a signed-in user when a reset signed
+     * them out (resetTo refuses them; BACKLOG D366). Bounded by
+     * [ResetTo.SIGNED_IN_ANONYMOUS_IDS_MAX]; cleared by [clearAllData].
+     */
+    fun getSignedInAnonymousIds(): List<String> {
+        val raw = prefs.getString(KEY_SIGNED_IN_ANONYMOUS_IDS, null) ?: return emptyList()
+        return try {
+            val arr = org.json.JSONArray(raw)
+            List(arr.length()) { arr.optString(it) }.filter { it.isNotEmpty() }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun rememberSignedInAnonymousId(id: String) {
+        val next = ResetTo.remember(getSignedInAnonymousIds(), id)
+        prefs.edit().putString(KEY_SIGNED_IN_ANONYMOUS_IDS, org.json.JSONArray(next).toString()).apply()
     }
 
     // MARK: - Anonymous ID
