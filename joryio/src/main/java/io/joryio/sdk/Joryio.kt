@@ -1472,7 +1472,7 @@ class Joryio private constructor(
             }
             storage.setHeldUserId(null)
             // A click-link token held for the outgoing visitor is not the
-            // next one's: it would attach the new anonymous id to them.
+            // next one's: it would attribute the new visitor's events to them.
             synchronized(acceptedLinkTokens) { heldLinkTokens.clear() }
             // Attribute ops of the outgoing person are dropped with their
             // pending writes (contract item 6). Identify, aliases and
@@ -3226,8 +3226,10 @@ class Joryio private constructor(
      *
      * Pass the URL that opened the app (an app link / deep link: the
      * Activity's `intent.data` in onCreate and onNewIntent). When it carries
-     * the `jr_t` token the click redirect added, this visitor is attached to
-     * the contact the message was sent to. Fire-and-forget; a URL without a
+     * the `jr_t` token the click redirect added, this app's events are
+     * attributed to the contact the message was sent to. Attribution only: the
+     * person is not identified and this profile is never merged into the
+     * contact (only identify() does that). Fire-and-forget; a URL without a
      * well-formed `jr_t` does nothing.
      *
      * - Already identified (identify() / a userId): nothing - a link never
