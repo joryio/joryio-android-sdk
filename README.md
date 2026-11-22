@@ -232,7 +232,7 @@ Every Joryio push carries the same keys on Android, iOS and web. The names are a
 | `jry_campaign_id` | The campaign id, or the journey id for a journey send. For your app; the SDK does not act on it |
 | `jry_deep_link` | What a tap opens (see below) |
 | `jry_image_url` | Image, when the message has no FCM notification image |
-| `jry_sync` | Silent sync nudge. `in_app` (or `campaigns`) makes the SDK fetch in-app campaigns now; nothing is shown |
+| `jry_sync` | Silent sync nudge. `in_app` (or `campaigns`) makes the SDK fetch in-app campaigns now; `flags` refreshes feature flags; nothing is shown |
 | `title`, `body` | Used when the message has no FCM notification block |
 
 When the user taps a notification the SDK records the click and opens your launcher activity - whether the SDK drew the notification (app in the foreground) or Android did (app in the background). Every data key arrives as an intent extra under its own name, so the deep link is always `jry_deep_link`; navigating to it is up to your app:

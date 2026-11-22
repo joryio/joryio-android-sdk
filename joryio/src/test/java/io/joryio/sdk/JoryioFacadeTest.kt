@@ -163,6 +163,26 @@ class JoryioFacadeTest {
         val headers = api.seen.first().headers
         assertEquals(Joryio.SDK_VERSION, headers["X-Joryio-SDK-Version"])
         assertTrue(headers["User-Agent"]!!.startsWith("Joryio-Android/${Joryio.SDK_VERSION}"))
+        // D427: the platform rides with it; a native app is not a bridge.
+        assertEquals("android", headers["X-Joryio-SDK"])
+        assertEquals(null, headers["X-Joryio-SDK-Wrapper"])
+    }
+
+    @Test
+    fun `a bridge names itself on every request`() {
+        // D427: React Native and Unity call setSdkWrapper before initialize();
+        // their requests leave through this SDK, which still says android.
+        assertTrue(Joryio.setSdkWrapper("react-native", "1.3.3"))
+        assertFalse(Joryio.setSdkWrapper("react native", "1.3.3"))
+        assertFalse(Joryio.setSdkWrapper("unity", "1.3.3\r\nX-Evil: 1"))
+        init()
+        assertTrue(pumpUntil { api.seen.isNotEmpty() })
+        for (req in api.seen) {
+            assertEquals("android", req.headers["X-Joryio-SDK"])
+            assertEquals(Joryio.SDK_VERSION, req.headers["X-Joryio-SDK-Version"])
+            assertEquals("react-native", req.headers["X-Joryio-SDK-Wrapper"])
+            assertEquals("1.3.3", req.headers["X-Joryio-SDK-Wrapper-Version"])
+        }
     }
 
     @Test

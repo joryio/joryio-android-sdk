@@ -98,6 +98,18 @@ internal interface JoryioApi {
     ): Response<ResolveResponse>
 
     /** Track in-app message impression. */
+    /** Placements (docs/PLACEMENTS_PLAN.md 3.5): the body is built and read as raw JSON. */
+    @POST("v1/in-app/placements")
+    suspend fun fetchPlacements(
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
+    /** Content cards (docs/PLACEMENTS_PLAN.md 11.3): the body is built and read as raw JSON. */
+    @POST("v1/in-app/cards")
+    suspend fun fetchCards(
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
     @POST("v1/in-app/track")
     suspend fun trackImpression(
         @Body request: TrackImpressionRequest
@@ -132,6 +144,13 @@ internal interface JoryioApi {
      * has no SDK key. It used to be a relative path under the `/api/` base URL
      * and 404ed on production for every Android push.
      */
+    /** Feature flags (flags/FlagsManager.kt): the body is built and read as raw JSON. */
+    @POST
+    suspend fun postFlags(
+        @Url path: String,
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
     /** A body serialised earlier, replayed verbatim (the write outbox). */
     @POST
     suspend fun postJson(

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- PlacementView: app:joryioPlacementKey="home_hero" (docs/PLACEMENTS_PLAN.md 3.11). -->
+    <declare-styleable name="PlacementView">
+        <attr name="joryioPlacementKey" format="string" />
+        <!-- The built-in product cards row (D444): on by default, an optional button label, the card width in dp. -->
+        <attr name="joryioShowProducts" format="boolean" />
+        <attr name="joryioProductButtonText" format="string" />
+        <attr name="joryioProductCardWidth" format="integer" />
+    </declare-styleable>
+</resources>

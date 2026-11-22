@@ -48,3 +48,4 @@ rootProject.name = "joryio-sdk-android"
 // can never drift apart in a consumer build - the consumer names one version.
 include(":joryio")
 include(":joryio-ui")
+include(":joryio-compose")

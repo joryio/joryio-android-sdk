@@ -16,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import io.joryio.sdk.core.SdkIdentity
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
 import retrofit2.Retrofit
@@ -247,11 +248,13 @@ internal class NetworkClient(
      */
     private fun createAuthInterceptor(): Interceptor {
         return Interceptor { chain ->
-            val request = chain.request().newBuilder()
+            val builder = chain.request().newBuilder()
+            // X-Joryio-SDK, X-Joryio-SDK-Version and - from a React Native or
+            // Unity bridge - X-Joryio-SDK-Wrapper(-Version). See SdkIdentity.
+            for ((name, value) in SdkIdentity.headers()) builder.header(name, value)
+            val request = builder
                 .addHeader("Authorization", "Bearer $sdkKey")
                 .addHeader("Content-Type", "application/json")
-                .addHeader("X-Joryio-SDK", "android")
-                .addHeader("X-Joryio-SDK-Version", Logger.SDK_VERSION)
                 // Identify ourselves. Without this OkHttp sends its default
                 // `okhttp/4.x`, which server-side bot heuristics classify as an
                 // automated HTTP client — so /v1/in-app/sync answered
@@ -736,6 +739,24 @@ internal class NetworkClient(
         }
     }
 
+    /**
+     * Feature flags (flags/FlagsManager.kt): POST [path] ONCE - no retries,
+     * the held answer stays in use until the next refresh. The
+     * SDK-authentication token follows the body's `userId`, like every other
+     * request. Returns the body of a 2xx answer, else null.
+     */
+    suspend fun postFlags(path: String, json: String): String? = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.postFlags(path, body)
+            if (response.isSuccessful) response.body()?.string() else null
+        } catch (e: Exception) {
+            logger.debug("Flags request failed: ${e.message}")
+            null
+        }
+    }
+
     // MARK: - Subscriptions (marketing, not tracking consent)
 
     suspend fun updateChannelSubscription(
@@ -759,6 +780,40 @@ internal class NetworkClient(
     suspend fun syncInAppMessages(request: io.joryio.sdk.models.SessionSyncRequest): NetworkResult<io.joryio.sdk.models.SessionSyncResponse> {
         return executeWithRetry("syncInAppMessages") {
             api.syncInAppMessages(request)
+        }
+    }
+
+    /**
+     * POST v1/in-app/placements ONCE - no retries: a placement answer is only
+     * useful now, and a 429 (the per-device limit) means "keep your cache".
+     * Returns the HTTP status (0 = no answer) and, on success, the body.
+     */
+    suspend fun fetchPlacements(json: String): Pair<Int, String?> = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext 0 to null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.fetchPlacements(body)
+            response.code() to (if (response.isSuccessful) response.body()?.string() else null)
+        } catch (e: Exception) {
+            logger.debug("Placements request failed: ${e.message}")
+            0 to null
+        }
+    }
+
+    /**
+     * POST v1/in-app/cards ONCE - no retries, like placements: a 429 (the
+     * per-device limit) or a failure means "keep your cached feed".
+     * Returns the HTTP status (0 = no answer) and, on success, the body.
+     */
+    suspend fun fetchCards(json: String): Pair<Int, String?> = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext 0 to null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.fetchCards(body)
+            response.code() to (if (response.isSuccessful) response.body()?.string() else null)
+        } catch (e: Exception) {
+            logger.debug("Card feed request failed: ${e.message}")
+            0 to null
         }
     }
 
