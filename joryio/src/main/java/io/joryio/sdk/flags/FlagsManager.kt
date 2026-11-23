@@ -11,7 +11,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.io.Closeable
 
 /** A refresh asked for within this many seconds of the last one is skipped (start, identify, push and refreshFlags() always go). */
 const val FLAGS_MIN_REFRESH_SECONDS = 60L
@@ -188,11 +187,11 @@ internal class FlagsManager(
         refresh(force = true)
     }
 
-    fun onFlagsUpdated(listener: (List<String>) -> Unit): Closeable {
+    fun onFlagsUpdated(listener: (List<String>) -> Unit): io.joryio.sdk.JoryioSubscription {
         val token = Any()
         synchronized(lock) { listeners[token] = listener }
         use()
-        return Closeable { synchronized(lock) { listeners.remove(token) } }
+        return io.joryio.sdk.JoryioSubscription { synchronized(lock) { listeners.remove(token) } }
     }
 
     // ── Internals ────────────────────────────────────────────────────────

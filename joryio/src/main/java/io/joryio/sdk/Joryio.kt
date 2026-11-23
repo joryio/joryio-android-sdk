@@ -2871,7 +2871,7 @@ class Joryio private constructor(
     fun refreshPlacements(placementKeys: List<String>? = null) = placementManager.refreshPlacements(placementKeys)
 
     /** Called on the main thread with the placements whose content changed. Close the result to stop. */
-    fun onPlacementsUpdated(listener: (Map<String, io.joryio.sdk.placements.Placement>) -> Unit): java.io.Closeable =
+    fun onPlacementsUpdated(listener: (Map<String, io.joryio.sdk.placements.Placement>) -> Unit): JoryioSubscription =
         placementManager.onPlacementsUpdated(listener)
 
     /** For Joryio's own placement views (PlacementView, the React Native view). */
@@ -2929,7 +2929,7 @@ class Joryio private constructor(
     fun refreshCards() = cardManager.refreshCards()
 
     /** Called on the main thread with the whole feed whenever it changes. Close the result to stop. */
-    fun onCardsUpdated(listener: (io.joryio.sdk.cards.CardFeed) -> Unit): java.io.Closeable =
+    fun onCardsUpdated(listener: (io.joryio.sdk.cards.CardFeed) -> Unit): JoryioSubscription =
         cardManager.onCardsUpdated(listener)
 
     // ── Feature flags (BACKLOG D446) ─────────────────────────────────────
@@ -3004,7 +3004,7 @@ class Joryio private constructor(
     }
 
     /** Called on the main thread with the keys whose value changed. Close the result to stop. */
-    fun onFlagsUpdated(listener: (List<String>) -> Unit): java.io.Closeable =
+    fun onFlagsUpdated(listener: (List<String>) -> Unit): JoryioSubscription =
         flagsManager.onFlagsUpdated(listener)
 
     /** The silent push `jry_sync: "flags"`: refresh now. */
@@ -4053,6 +4053,54 @@ class Joryio private constructor(
         /** Answers once the SDK is initialized (queued before). */
         fun getCards(callback: (io.joryio.sdk.cards.CardFeed) -> Unit) = withSdk { it.getCards(callback) }
 
+        /** The page after [cursor] (a feed's `nextCursor`). Answers once the SDK is initialized (queued before). */
+        fun getCards(cursor: String?, callback: (io.joryio.sdk.cards.CardFeed) -> Unit) = withSdk { it.getCards(cursor, callback) }
+
+        /** Unread cards from the cache (never a network call); 0 before initialize(). */
+        fun getUnreadCardCount(): Int = instance?.getUnreadCardCount() ?: 0
+
+        // The card reports on the shared instance, like iOS's Joryio.shared and
+        // the web / React Native / Unity data API (BACKLOG D444): queued until
+        // initialize() as data calls (dropped while opted out or denied).
+
+        /** See the instance [Joryio.markCardViewed]. */
+        fun markCardViewed(card: io.joryio.sdk.cards.Card) = withData { it.markCardViewed(card) }
+
+        /** See the instance [Joryio.markCardViewed]. */
+        fun markCardViewed(cardId: String) = withData { it.markCardViewed(cardId) }
+
+        /** See the instance [Joryio.markCardRead]. */
+        fun markCardRead(card: io.joryio.sdk.cards.Card) = withData { it.markCardRead(card) }
+
+        /** See the instance [Joryio.markCardRead]. */
+        fun markCardRead(cardId: String) = withData { it.markCardRead(cardId) }
+
+        /** See the instance [Joryio.markCardClicked]. */
+        fun markCardClicked(card: io.joryio.sdk.cards.Card) = withData { it.markCardClicked(card) }
+
+        /** See the instance [Joryio.markCardClicked]. */
+        fun markCardClicked(cardId: String) = withData { it.markCardClicked(cardId) }
+
+        /** See the instance [Joryio.dismissCard]. */
+        fun dismissCard(card: io.joryio.sdk.cards.Card) = withData { it.dismissCard(card) }
+
+        /** See the instance [Joryio.dismissCard]. */
+        fun dismissCard(cardId: String) = withData { it.dismissCard(cardId) }
+
+        /**
+         * Registers [listener] once the SDK is initialized (queued before).
+         * Cancelling the result before then cancels the registration.
+         */
+        fun onCardsUpdated(listener: (io.joryio.sdk.cards.CardFeed) -> Unit): JoryioSubscription =
+            JoryioSubscription.deferred({ withSdk(action = it) }) { it.onCardsUpdated(listener) }
+
+        /**
+         * Registers [listener] once the SDK is initialized (queued before).
+         * Cancelling the result before then cancels the registration.
+         */
+        fun onPlacementsUpdated(listener: (Map<String, io.joryio.sdk.placements.Placement>) -> Unit): JoryioSubscription =
+            JoryioSubscription.deferred({ withSdk(action = it) }) { it.onPlacementsUpdated(listener) }
+
         /** Answers once the SDK is initialized (queued before). */
         fun getPlacements(placementKeys: List<String>, callback: (Map<String, io.joryio.sdk.placements.Placement>) -> Unit) =
             withSdk { it.getPlacements(placementKeys, callback) }
@@ -4078,25 +4126,10 @@ class Joryio private constructor(
 
         /**
          * Registers [listener] once the SDK is initialized (queued before).
-         * Closing the result before then cancels the registration.
+         * Cancelling the result before then cancels the registration.
          */
-        fun onFlagsUpdated(listener: (List<String>) -> Unit): java.io.Closeable {
-            val closed = java.util.concurrent.atomic.AtomicBoolean(false)
-            var registered: java.io.Closeable? = null
-            val lock = Any()
-            withSdk { sdk ->
-                synchronized(lock) {
-                    if (!closed.get()) registered = sdk.onFlagsUpdated(listener)
-                }
-            }
-            return java.io.Closeable {
-                synchronized(lock) {
-                    closed.set(true)
-                    registered?.close()
-                    registered = null
-                }
-            }
-        }
+        fun onFlagsUpdated(listener: (List<String>) -> Unit): JoryioSubscription =
+            JoryioSubscription.deferred({ withSdk(action = it) }) { it.onFlagsUpdated(listener) }
 
         fun resetDisplayedCampaigns() = withSdk { it.resetDisplayedCampaigns() }
 

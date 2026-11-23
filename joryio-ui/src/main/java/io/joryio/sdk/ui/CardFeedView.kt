@@ -20,7 +20,7 @@ import android.widget.TextView
 import io.joryio.sdk.Joryio
 import io.joryio.sdk.cards.Card
 import io.joryio.sdk.cards.CardFeed
-import java.io.Closeable
+import io.joryio.sdk.JoryioSubscription
 
 /**
  * The person's content cards as a plain scrolling list (docs/PLACEMENTS_PLAN.md
@@ -79,7 +79,7 @@ class CardFeedView @JvmOverloads constructor(
     private val column = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
     private val viewability = ViewabilityTracker(this)
     private var sdk: Joryio? = null
-    private var subscription: Closeable? = null
+    private var subscription: JoryioSubscription? = null
     private var feed: CardFeed? = null
     private var loadingMore = false
 
@@ -108,7 +108,7 @@ class CardFeedView @JvmOverloads constructor(
     override fun onDetachedFromWindow() {
         viewTreeObserver.removeOnGlobalLayoutListener(layoutListener)
         viewTreeObserver.removeOnWindowFocusChangeListener(focusListener)
-        try { subscription?.close() } catch (e: Exception) { /* nothing to undo */ }
+        subscription?.cancel()
         subscription = null
         viewability.cancel()
         super.onDetachedFromWindow()

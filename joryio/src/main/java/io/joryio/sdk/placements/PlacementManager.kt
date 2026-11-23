@@ -11,7 +11,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.Closeable
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -143,9 +142,9 @@ internal class PlacementManager(
         if (wanted.isNotEmpty()) fetchKeys(wanted, force = true) {}
     }
 
-    fun onPlacementsUpdated(listener: (Map<String, Placement>) -> Unit): Closeable {
+    fun onPlacementsUpdated(listener: (Map<String, Placement>) -> Unit): io.joryio.sdk.JoryioSubscription {
         synchronized(lock) { listeners.add(listener) }
-        return Closeable { synchronized(lock) { listeners.remove(listener) } }
+        return io.joryio.sdk.JoryioSubscription { synchronized(lock) { listeners.remove(listener) } }
     }
 
     /** A view starts showing [host]'s placement: drawn from the cache, fetched when stale. */

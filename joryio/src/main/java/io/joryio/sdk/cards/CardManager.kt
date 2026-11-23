@@ -12,7 +12,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.Closeable
 import java.util.Locale
 import kotlin.coroutines.resume
 
@@ -141,10 +140,10 @@ internal class CardManager(
         fetch(force = true) {}
     }
 
-    fun onCardsUpdated(listener: (CardFeed) -> Unit): Closeable {
+    fun onCardsUpdated(listener: (CardFeed) -> Unit): io.joryio.sdk.JoryioSubscription {
         used = true
         synchronized(lock) { listeners.add(listener) }
-        return Closeable { synchronized(lock) { listeners.remove(listener) } }
+        return io.joryio.sdk.JoryioSubscription { synchronized(lock) { listeners.remove(listener) } }
     }
 
     fun markCardViewed(card: Card) = report(card.id, card.deliveryToken, CardActions.VIEWED)

@@ -218,6 +218,26 @@ class CardManagerTest {
     }
 
     @Test
+    fun onCardsUpdatedAnswersAJoryioSubscriptionWhoseCancelStopsTheUpdates() = runBlocking {
+        val t = FakeTransport { feed(listOf(card("a"), card("b")), unread = 2) }
+        val m = manager(t)
+        m.getCards()
+        val updates = ArrayList<CardFeed>()
+        val sub: io.joryio.sdk.JoryioSubscription = m.onCardsUpdated { updates.add(it) }
+        m.markCardRead("a")
+        assertEquals(1, updates.size)
+        sub.cancel()
+        sub.cancel() // twice is harmless
+        m.markCardRead("b")
+        assertEquals(1, updates.size)
+        // close() is the same (java.io.Closeable, for use { }).
+        val other = m.onCardsUpdated { updates.add(it) }
+        other.use { m.dismissCard("a") }
+        m.dismissCard("b")
+        assertEquals(2, updates.size)
+    }
+
+    @Test
     fun anAnonymousVisitorsReadAndDismissedStayOnTheDeviceUntilReset() = runBlocking {
         user = null
         val store = MemoryStore()
