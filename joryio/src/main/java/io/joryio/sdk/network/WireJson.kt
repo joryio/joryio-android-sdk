@@ -4,6 +4,8 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.ToNumberPolicy
 import com.google.gson.TypeAdapter
+import com.google.gson.TypeAdapterFactory
+import com.google.gson.reflect.TypeToken
 import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
 import com.google.gson.stream.JsonWriter
@@ -78,7 +80,41 @@ internal object WireJson {
      *    form answer handed to `evaluateJavascript` (a JS literal, not markup;
      *    U+2028/U+2029 are still escaped by Gson either way).
      */
+    /**
+     * 4. A whole-number Double or Float is written as an integer (1.4.0-beta.9
+     *    test). Gson writes 3.0 as `3.0`; iOS (JSONSerialization) and the web
+     *    (JSON.stringify) write `3`, so one property had two wire values. React
+     *    Native hands every JS number to Android as a Double, and Unity's JSON
+     *    can too - `track("x", { n: 3 })` from JS reached the server as 3.0
+     *    from Android only. A real fraction (3.5) is written as before, and
+     *    so is a whole number beyond 2^53, where a Double no longer holds
+     *    every integer exactly.
+     */
+    internal fun isWireInteger(d: Double): Boolean =
+        !d.isNaN() && !d.isInfinite() && d == Math.floor(d) && Math.abs(d) <= MAX_SAFE_INTEGER
+
+    private const val MAX_SAFE_INTEGER = 9007199254740991.0 // 2^53 - 1
+
+    private object WholeNumberFactory : TypeAdapterFactory {
+        override fun <T> create(gson: Gson, type: TypeToken<T>): TypeAdapter<T>? {
+            val raw = type.rawType
+            if (raw != java.lang.Double::class.java && raw != java.lang.Double.TYPE &&
+                raw != java.lang.Float::class.java && raw != java.lang.Float.TYPE
+            ) return null
+            val delegate = gson.getDelegateAdapter(this, type)
+            return object : TypeAdapter<T>() {
+                override fun write(out: JsonWriter, value: T?) {
+                    val d = (value as? Number)?.toDouble()
+                    if (d != null && isWireInteger(d)) out.value(d.toLong()) else delegate.write(out, value)
+                }
+
+                override fun read(input: JsonReader): T? = delegate.read(input)
+            }
+        }
+    }
+
     val gson: Gson = GsonBuilder()
+        .registerTypeAdapterFactory(WholeNumberFactory)
         .registerTypeAdapter(Date::class.java, UtcDateAdapter)
         .setObjectToNumberStrategy(ToNumberPolicy.LONG_OR_DOUBLE)
         .disableHtmlEscaping()

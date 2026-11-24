@@ -184,7 +184,10 @@ internal class PlacementManager(
         val consent: String?,
         val generation: Int,
         val queuedAt: Long,
+        /** Tracking order, stamped when the event is tracked: "oldest" past the cap means tracked first. */
+        val seq: Long,
     )
+    private var recheckSeq = 0L
     private var cancelMomentTimer: (() -> Unit)? = null
 
     @Volatile
@@ -300,6 +303,7 @@ internal class PlacementManager(
     ) {
         val changed = LinkedHashSet<String>()
         val recheck = ArrayList<String>()
+        var seq = 0L
         synchronized(lock) {
             for ((key, entry) in cache) {
                 for (item in entry.placement.items) {
@@ -325,11 +329,12 @@ internal class PlacementManager(
             visitEventsLocked()
             sessionEvents.add(eventName)
             changed.addAll(updateMomentsLocked())
+            if (recheck.isNotEmpty()) seq = ++recheckSeq
         }
         if (changed.isNotEmpty()) applyChanged(changed.toList())
         reportDueDeferredControls()
         if (recheck.isNotEmpty()) {
-            val rc = Recheck(recheck, event?.eventId, event?.let { recheckEventJson(it) }, subjectKey(), consent(), generation, now())
+            val rc = Recheck(recheck, event?.eventId, event?.let { recheckEventJson(it) }, subjectKey(), consent(), generation, now(), seq)
             scope.launch {
                 try { beforeRecheck?.invoke() } catch (e: Exception) { log("Queueing before a re-check failed: ${e.message}") }
                 startRecheck(rc)
@@ -342,8 +347,11 @@ internal class PlacementManager(
         val id = rc.eventId
         if (id != null && !(try { deliverEvent(id) } catch (e: Exception) { false })) {
             // Still queued (the flush failed): once, after the next flush that sends it.
+            // Kept in tracking order (each delivery returns in its own time), so the
+            // one dropped past the cap is the OLDEST tracked, as on iOS.
             synchronized(lock) {
-                pendingRechecks.add(rc)
+                val at = pendingRechecks.indexOfFirst { it.seq > rc.seq }
+                if (at < 0) pendingRechecks.add(rc) else pendingRechecks.add(at, rc)
                 while (pendingRechecks.size > PENDING_RECHECK_MAX) pendingRechecks.removeAt(0)
             }
             return
@@ -384,7 +392,8 @@ internal class PlacementManager(
     private fun recheckEventJson(event: io.joryio.sdk.models.Event): JsonObject = JsonObject().apply {
         addProperty("name", event.type)
         addProperty("eventId", event.eventId)
-        add("properties", gson.toJsonTree(event.properties).takeIf { it.isJsonObject } ?: JsonObject())
+        // WireJson, as the queue writes the event: a whole number goes as 3, not 3.0.
+        add("properties", io.joryio.sdk.network.WireJson.gson.toJsonTree(event.properties).takeIf { it.isJsonObject } ?: JsonObject())
     }
 
     // ── fetching ────────────────────────────────────────────────────────

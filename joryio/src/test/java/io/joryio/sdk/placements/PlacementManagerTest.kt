@@ -634,6 +634,48 @@ class PlacementManagerTest {
         assertEquals("the oldest five were dropped", names.takeLast(20).toSet(), sentNames.toSet())
     }
 
+    /**
+     * 1.4.0-beta.9 test: one coroutine per event, each failed delivery returning
+     * in its own time - the waiting list followed failure-completion order and
+     * dropped the wrong ones past 20. Here the OLDEST deliveries fail LAST.
+     */
+    @Test
+    fun pendingReChecksPastTwentyDropTheOldestTrackedEvenWhenFailuresReturnOutOfOrder() {
+        val names = (0 until 25).map { "e$it" }
+        val t = recheckHero(names)
+        val events = names.map { ev(it) }
+        val order = events.withIndex().associate { (i, e) -> e.eventId to i }
+        val m = PlacementManager(
+            transport = t,
+            store = null,
+            consent = { consentValue },
+            userId = { user },
+            anonymousId = { "anon-1" },
+            sessionId = { session },
+            capabilities = { listOf("placements", "content.native", "content.data") },
+            locale = { "he-IL" },
+            postMain = { it.run() },
+            now = { clock },
+            screenClock = screenClock(),
+            // e0 fails last, e24 first.
+            deliverEvent = { id -> kotlinx.coroutines.delay(20L * (25 - (order[id] ?: 0))); delivered.add(id); false },
+            isEventQueued = { it in stillQueued },
+            schedule = { ms, _ -> scheduled.add(ms); {} },
+        )
+        runBlocking { m.getPlacements(listOf("home_hero")) }
+        stillQueued = events.map { it.eventId }.toSet()
+        names.zip(events).forEach { (n, e) -> m.onEventTracked(n, emptyMap(), e) } // no pause between them
+        waitUntil { delivered.size >= names.size }
+        Thread.sleep(100)
+        assertEquals(20, m.pendingRecheckCount)
+        stillQueued = emptySet()
+        m.onEventsFlushed()
+        waitUntil { t.fetches.size == 21 }
+        Thread.sleep(200)
+        val sentNames = t.fetches.drop(1).map { it.getAsJsonObject("recheckEvent").get("name").asString }
+        assertEquals("the five tracked first were dropped", names.takeLast(20).toSet(), sentNames.toSet())
+    }
+
     @Test
     fun aControlAnswerReportsControlViewedOnlyAfterItsMoment() = runBlocking {
         val t = FakeTransport { answer(""""home_hero":{"placementKey":"home_hero","isControl":true,"controlToken":"ctl-1","items":[],"showWhen":{"kind":"seconds","seconds":5}}""") }

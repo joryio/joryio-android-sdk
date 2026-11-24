@@ -420,7 +420,8 @@ internal class FlagsManager(
     private fun jsonSafe(map: Map<String, Any?>): JsonObject = JsonObject().apply {
         for ((k, v) in map) {
             try {
-                add(k, gson.toJsonTree(v))
+                // WireJson: a whole number goes as 3, not 3.0 - as on iOS and the web.
+                add(k, io.joryio.sdk.network.WireJson.gson.toJsonTree(v))
             } catch (e: Exception) {
                 // Left out.
             }
