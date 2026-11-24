@@ -215,7 +215,9 @@ class PlacementView @JvmOverloads constructor(
             views.forEach { (v, item) -> viewability.add(v) { item.markDisplayed() } }
         } else {
             minimumHeight = if (placement.emptyBehavior == PlacementEmptyBehavior.KEEP_SPACE) previousHeight else 0
-            if (placement.isControl) viewability.add(this) { placement.markDisplayed() }
+            // A held-out spot reports control_viewed; on any empty spot it also tells
+            // the SDK the spot was viewable (a deferred control of a Show when campaign).
+            viewability.add(this) { placement.markDisplayed() }
         }
         contentDescription = if (views.isEmpty()) null else placement.placementKey
         try {

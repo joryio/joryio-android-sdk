@@ -35,7 +35,12 @@ internal class PlacementItemWire(
     val expiresAt: String?,
     /** The raw JSON, kept for the disk cache and for change detection. */
     val json: JsonObject,
+    /** "Show when" (D465): the moment it is revealed on a screen; absent = load. */
+    val showWhen: ShowWhenMoment = ShowWhenMoment.Load,
 )
+
+/** A control exposure that waits for its own Show when moment (D465). */
+internal class DeferredControl(val controlToken: String, val showWhen: ShowWhenMoment)
 
 /** One placement as the server sends it. */
 internal class PlacementWire(
@@ -47,6 +52,18 @@ internal class PlacementWire(
     val controlToken: String?,
     val items: List<PlacementItemWire>,
     val json: JsonObject,
+    /**
+     * A control answer's "Show when" (D465): the moment the held-out treatment
+     * would have been revealed - `control_viewed` waits for it.
+     */
+    val showWhen: ShowWhenMoment = ShowWhenMoment.Load,
+    /**
+     * Control exposures of A/B-control campaigns that fell through to the drawn
+     * item at a different moment: each reported once at ITS moment, once the spot was viewable.
+     */
+    val deferredControls: List<DeferredControl> = emptyList(),
+    /** Event names that, when tracked, make the SDK re-fetch this key at once. */
+    val recheckOn: List<String> = emptyList(),
 )
 
 /** The HTTP the manager needs; NetworkClient in the app, a fake in tests. */
@@ -78,7 +95,21 @@ internal interface PlacementCacheStore {
  *   failure keeps the cache;
  * - an identity or consent change bumps a generation: answers to requests made
  *   before it are discarded;
- * - without consent the request names nobody and nothing is reported.
+ * - without consent the request names nobody and nothing is reported;
+ * - "Show when" (BACKLOG D465, packages/backend/src/common/show-when.ts): an
+ *   item, a control answer and each deferred control carry the moment they are
+ *   revealed on a screen. The content is fetched as before and HELD - left out
+ *   of every Placement - until its moment: `seconds` = foreground seconds on
+ *   the current screen (the time_on_screen ScreenClock), `event` = the event
+ *   was tracked in this visit (SDK session). `scroll` / `exit` / unknown are
+ *   never shown. Revealed content stays for the screen; a new screen starts
+ *   the moment again. An event that something waits on (or that the answer
+ *   lists in `recheckOn`) re-checks the key at once, past
+ *   PLACEMENT_MIN_REFRESH_SECONDS, at most once per (key, event) per screen:
+ *   only after the event has left the queue (sent by the flush in flight or
+ *   one more; after a failure, once after the next successful flush), in a
+ *   request of its own that carries the event as
+ *   `recheckEvent: { name, eventId, properties }`.
  */
 internal class PlacementManager(
     private val transport: PlacementTransport,
@@ -95,6 +126,14 @@ internal class PlacementManager(
     private val now: () -> Long = { System.currentTimeMillis() },
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob()),
     private val log: (String) -> Unit = {},
+    /** The time_on_screen clock: `seconds` moments count on it. */
+    private val screenClock: io.joryio.sdk.messaging.ScreenClock = io.joryio.sdk.messaging.ScreenClock(now),
+    /** Sends the queue until this event (client eventId) has left it; false = still queued. */
+    private val deliverEvent: suspend (String) -> Boolean = { true },
+    /** Is this event still queued? (a pending re-check runs once it is not) */
+    private val isEventQueued: suspend (String) -> Boolean = { false },
+    /** Runs a block after a delay (ms); returns its cancel. A seam for tests. */
+    private val schedule: ((Long, () -> Unit) -> (() -> Unit))? = null,
 ) : PlacementReporter {
 
     private class Entry(val placement: PlacementWire, val fetchedAt: Long)
@@ -113,12 +152,56 @@ internal class PlacementManager(
     private val triggeredAt = HashMap<String, Long>()
     private val dismissedLocally = HashSet<String>()
 
+    // "Show when" (D465)
+    private enum class MomentKind { ITEM, CONTROL, DEFERRED }
+    private data class MomentId(val kind: MomentKind, val key: String, val token: String)
+
+    /** Moments reached on the current screen (cleared by a new screen). */
+    private val revealed = HashSet<MomentId>()
+    /** Keys whose spot was viewable on the current screen (deferred controls wait for it). */
+    private val viewedOnScreen = HashSet<String>()
+    /** `key\u0000event` re-checked on the current screen. */
+    private val rechecked = HashSet<String>()
+    /** Event names tracked in the visit [sessionEventsId]. */
+    private val sessionEvents = HashSet<String>()
+    private var sessionEventsId: String? = null
+    /** Re-checks whose event is still queued (a failed flush): run once after a flush sent it. */
+    private val pendingRechecks = ArrayList<Recheck>()
+    /** Answers apply in request order: an older request answering last never overwrites a newer one. */
+    private var requestSeq = 0
+    private val appliedSeq = HashMap<String, Int>()
+
+    /**
+     * [event]: `{ name, eventId, properties }`, the event as queued; null without
+     * the event. [subject], [consent] and [generation]: who and under which
+     * consent it was queued for - it never runs for anyone else.
+     */
+    private class Recheck(
+        val keys: List<String>,
+        val eventId: String?,
+        val event: JsonObject?,
+        val subject: String,
+        val consent: String?,
+        val generation: Int,
+        val queuedAt: Long,
+    )
+    private var cancelMomentTimer: (() -> Unit)? = null
+
     @Volatile
     private var generation = 0
     private val gson = Gson()
 
     init {
         loadCache()
+        synchronized(lock) { updateMomentsLocked() }
+        screenClock.observe { change ->
+            when (change) {
+                io.joryio.sdk.messaging.ScreenClock.Change.SCREEN -> screenChanged()
+                io.joryio.sdk.messaging.ScreenClock.Change.PAUSED -> stopMomentTimer()
+                io.joryio.sdk.messaging.ScreenClock.Change.RESUMED -> scheduleMomentTimer()
+            }
+        }
+        scheduleMomentTimer()
     }
 
     // ── public surface (through Joryio) ─────────────────────────────────
@@ -189,6 +272,10 @@ internal class PlacementManager(
             triggeredAt.clear()
             dismissedLocally.clear()
             reported.clear()
+            revealed.clear()
+            viewedOnScreen.clear()
+            rechecked.clear()
+            pendingRechecks.clear()
             toClear = hosts.toList()
             keys = toClear.map { it.placementKey }.distinct()
         }
@@ -198,9 +285,21 @@ internal class PlacementManager(
         if (keys.isNotEmpty()) fetchKeys(keys, force = true) {}
     }
 
-    /** An event was tracked: event-triggered items waiting on it become eligible (no round trip). */
-    fun onEventTracked(eventName: String, properties: Map<String, Any?>) {
+    /**
+     * An event was tracked: event-triggered items waiting on it become eligible
+     * (no round trip); "Show when" `event` moments are reached, and the keys
+     * waiting on it are re-checked. [event]: the event as queued - its eventId
+     * gates the re-check and rides on it; [beforeRecheck] runs first (the
+     * event's insert into the queue).
+     */
+    fun onEventTracked(
+        eventName: String,
+        properties: Map<String, Any?>,
+        event: io.joryio.sdk.models.Event? = null,
+        beforeRecheck: (suspend () -> Unit)? = null,
+    ) {
         val changed = LinkedHashSet<String>()
+        val recheck = ArrayList<String>()
         synchronized(lock) {
             for ((key, entry) in cache) {
                 for (item in entry.placement.items) {
@@ -213,8 +312,79 @@ internal class PlacementManager(
                     }
                 }
             }
+            // Show when: the keys that wait on this event, BEFORE it counts.
+            val moment = ShowWhenMoment.Event(eventName)
+            for ((key, entry) in cache) {
+                val p = entry.placement
+                val waits = eventName in p.recheckOn ||
+                    p.items.any { it.showWhen == moment && itemMoment(key, it) !in revealed } ||
+                    (p.isControl && p.showWhen == moment && controlMoment(key, p) !in revealed) ||
+                    p.deferredControls.any { it.showWhen == moment && MomentId(MomentKind.DEFERRED, key, it.controlToken) !in revealed }
+                if (waits && rechecked.add("$key\u0000$eventName")) recheck.add(key)
+            }
+            visitEventsLocked()
+            sessionEvents.add(eventName)
+            changed.addAll(updateMomentsLocked())
         }
         if (changed.isNotEmpty()) applyChanged(changed.toList())
+        reportDueDeferredControls()
+        if (recheck.isNotEmpty()) {
+            val rc = Recheck(recheck, event?.eventId, event?.let { recheckEventJson(it) }, subjectKey(), consent(), generation, now())
+            scope.launch {
+                try { beforeRecheck?.invoke() } catch (e: Exception) { log("Queueing before a re-check failed: ${e.message}") }
+                startRecheck(rc)
+            }
+        }
+    }
+
+    /** The server must have the event before it answers again. */
+    private suspend fun startRecheck(rc: Recheck) {
+        val id = rc.eventId
+        if (id != null && !(try { deliverEvent(id) } catch (e: Exception) { false })) {
+            // Still queued (the flush failed): once, after the next flush that sends it.
+            synchronized(lock) {
+                pendingRechecks.add(rc)
+                while (pendingRechecks.size > PENDING_RECHECK_MAX) pendingRechecks.removeAt(0)
+            }
+            return
+        }
+        runRecheck(rc)
+    }
+
+    /** The event queue finished a flush: re-checks whose event has left it run now, once. */
+    fun onEventsFlushed() {
+        // Too old, or queued for someone else / another consent: dropped, never run.
+        val waiting = synchronized(lock) {
+            pendingRechecks.removeAll { !stillValidLocked(it) }
+            pendingRechecks.toList()
+        }
+        if (waiting.isEmpty()) return
+        scope.launch {
+            val due = waiting.filter { rc -> rc.eventId?.let { !(try { isEventQueued(it) } catch (e: Exception) { true }) } ?: true }
+            val taken = synchronized(lock) { due.filter { pendingRechecks.remove(it) } }
+            taken.forEach { runRecheck(it) }
+        }
+    }
+
+    /** Re-checks waiting for their event (test seam). */
+    internal val pendingRecheckCount: Int get() = synchronized(lock) { pendingRechecks.size }
+
+    /** Lock held. The same person, consent and generation, and not older than the limit. */
+    private fun stillValidLocked(rc: Recheck): Boolean =
+        rc.generation == generation && now() - rc.queuedAt <= PENDING_RECHECK_MAX_AGE_MS &&
+            rc.subject == subjectKey() && rc.consent == consent()
+
+    /** A request of its own (never batched with other keys), past the refresh limit. */
+    private suspend fun runRecheck(rc: Recheck) {
+        if (!synchronized(lock) { stillValidLocked(rc) }) return
+        rc.keys.chunked(PLACEMENT_MAX_KEYS_PER_REQUEST).forEach { request(it, rc.event) }
+    }
+
+    /** `{ name, eventId, properties }` from the event as the queue serializes it. */
+    private fun recheckEventJson(event: io.joryio.sdk.models.Event): JsonObject = JsonObject().apply {
+        addProperty("name", event.type)
+        addProperty("eventId", event.eventId)
+        add("properties", gson.toJsonTree(event.properties).takeIf { it.isJsonObject } ?: JsonObject())
     }
 
     // ── fetching ────────────────────────────────────────────────────────
@@ -237,7 +407,7 @@ internal class PlacementManager(
 
     private fun ensure(keys: List<String>, done: () -> Unit) {
         val stale = synchronized(lock) { keys.filter { freshEntry(it) == null } }
-        if (stale.isEmpty()) done() else fetchKeys(stale, force = false, done)
+        if (stale.isEmpty()) done() else fetchKeys(stale, force = false, done = done)
     }
 
     /**
@@ -318,13 +488,15 @@ internal class PlacementManager(
         }
     }
 
-    private suspend fun request(keys: List<String>) {
+    private suspend fun request(keys: List<String>, recheckEvent: JsonObject? = null) {
         val consentNow = consent() ?: return
         val personal = consentNow == "granted"
         val generationAtStart = generation
         val body = JsonObject()
         val shown = JsonObject()
+        val seq: Int
         synchronized(lock) {
+            seq = ++requestSeq
             val t = now()
             keys.forEach { lastNetworkAt[it] = t }
             for (host in hosts) {
@@ -346,6 +518,8 @@ internal class PlacementManager(
         body.add("placements", JsonArray().apply { keys.forEach { add(it) } })
         body.add("shown", shown)
         body.add("context", JsonObject().apply { add("screen", null); add("url", null) })
+        // A Show when re-check: the event that triggered it, counted by the server as arriving now.
+        recheckEvent?.let { body.add("recheckEvent", it) }
 
         val (status, text) = try {
             transport.fetch(gson.toJson(body))
@@ -372,6 +546,9 @@ internal class PlacementManager(
             if (generation != generationAtStart) return
             val fetchedAt = now()
             for (key in keys) {
+                // An answer to an older request that arrived after a newer one: not applied.
+                if ((appliedSeq[key] ?: 0) > seq) continue
+                appliedSeq[key] = seq
                 // A key the server left out is an empty placement, never an error.
                 val json = placements.get(key)?.takeIf { it.isJsonObject }?.asJsonObject
                     ?: JsonObject().apply { addProperty("placementKey", key); add("items", JsonArray()) }
@@ -381,9 +558,13 @@ internal class PlacementManager(
                 dismissedLocally.removeAll { it.startsWith("$key\u0000") }
                 if (before == null || before.placement.json != wire.json) changed.add(key)
             }
+            // A moment already reached (an event earlier in the visit, seconds already spent) shows at once.
+            updateMomentsLocked().forEach { if (it !in changed) changed.add(it) }
         }
         persistCache()
         if (changed.isNotEmpty()) applyChanged(changed)
+        reportDueDeferredControls()
+        scheduleMomentTimer()
     }
 
     private fun applyChanged(keys: List<String>) {
@@ -406,6 +587,8 @@ internal class PlacementManager(
             val expires = item.expiresAt?.let { parseIso(it) }
             if (expires != null && expires <= t) return@filter false
             if (handle(key, item) in dismissedLocally) return@filter false
+            // Show when: held until its moment on this screen.
+            if (!itemOpenLocked(key, item)) return@filter false
             val eventTriggers = item.triggers.filter { it["type"] == "event" }
             if (eventTriggers.isNotEmpty()) {
                 val at = triggeredAt[handle(key, item)] ?: return@filter false
@@ -449,6 +632,12 @@ internal class PlacementManager(
         // Served for someone who is no longer here (identify / reset since): nothing.
         if (generation != this.generation) return
         if (consent() != "granted") return
+        if (type == "displayed") {
+            // An impression counts only when the content is shown: never while held (Show when).
+            if (!synchronized(lock) { itemOpenLocked(key, item) }) return
+            synchronized(lock) { viewedOnScreen.add(key) }
+            reportDueDeferredControls()
+        }
         val once = "$type:${handle(key, item)}"
         if (type != "clicked") {
             val first = synchronized(lock) { reported.add(once) }
@@ -485,12 +674,27 @@ internal class PlacementManager(
         applyChanged(listOf(key))
     }
 
-    /** A held-out person's empty spot was viewable: `in_app.control_viewed`, once per control token. */
+    /**
+     * A held-out person's empty spot was viewable: `in_app.control_viewed`, once
+     * per control token. With a Show when, not before the moment the treatment
+     * would have been revealed (ignored before it; onPlacementsUpdated fires at
+     * the moment). On any placement it also counts as "the spot was viewable"
+     * for the answer's deferred controls.
+     */
     override fun reportControl(generation: Int, key: String) {
         if (generation != this.generation) return
-        val token = synchronized(lock) { cache[key]?.placement?.takeIf { it.isControl }?.controlToken } ?: return
+        synchronized(lock) { viewedOnScreen.add(key) }
+        reportDueDeferredControls()
+        val token = synchronized(lock) {
+            cache[key]?.placement?.takeIf { it.isControl && controlOpenLocked(key, it) }?.controlToken
+        } ?: return
         if (consent() != "granted") return
         if (!synchronized(lock) { reported.add("control:$token") }) return
+        sendControlViewed(token, key)
+    }
+
+    /** The exact body of every `control_viewed` report. */
+    private fun sendControlViewed(token: String, key: String) {
         val body = JsonObject().apply {
             addProperty("action", "control_viewed")
             addProperty("controlToken", token)
@@ -500,6 +704,129 @@ internal class PlacementManager(
             addProperty("viewedAt", iso(now()))
         }
         send(body)
+    }
+
+    /** Deferred controls whose moment has come on a spot viewable on this screen: each once, with consent. */
+    private fun reportDueDeferredControls() {
+        if (consent() != "granted") return
+        val due = ArrayList<Pair<String, String>>()
+        synchronized(lock) {
+            for (key in viewedOnScreen) {
+                val p = cache[key]?.placement ?: continue
+                for (d in p.deferredControls) {
+                    if (!momentOpenLocked(d.showWhen, MomentId(MomentKind.DEFERRED, key, d.controlToken))) continue
+                    if (reported.add("control:${d.controlToken}")) due.add(d.controlToken to key)
+                }
+            }
+        }
+        due.forEach { (token, key) -> sendControlViewed(token, key) }
+    }
+
+    // ── Show when (D465) ────────────────────────────────────────────────
+
+    private fun itemMoment(key: String, item: PlacementItemWire) = MomentId(MomentKind.ITEM, key, item.deliveryToken ?: item.id)
+
+    private fun controlMoment(key: String, p: PlacementWire) = MomentId(MomentKind.CONTROL, key, p.controlToken ?: "")
+
+    /** Lock held. `load` always; otherwise once reached on this screen. */
+    private fun momentOpenLocked(moment: ShowWhenMoment, id: MomentId) = moment == ShowWhenMoment.Load || id in revealed
+
+    private fun itemOpenLocked(key: String, item: PlacementItemWire) = momentOpenLocked(item.showWhen, itemMoment(key, item))
+
+    private fun controlOpenLocked(key: String, p: PlacementWire) = momentOpenLocked(p.showWhen, controlMoment(key, p))
+
+    /** Lock held. The visit's event names, started over when the SDK session changed. */
+    private fun visitEventsLocked() {
+        val id = sessionId()
+        if (id != sessionEventsId) {
+            sessionEventsId = id
+            sessionEvents.clear()
+        }
+    }
+
+    /** Lock held. Has this moment come on the current screen? */
+    private fun reachedLocked(moment: ShowWhenMoment): Boolean = when (moment) {
+        ShowWhenMoment.Load -> true
+        is ShowWhenMoment.Seconds -> screenClock.seconds + 0.001 >= moment.seconds
+        is ShowWhenMoment.Event -> { visitEventsLocked(); moment.event in sessionEvents }
+        ShowWhenMoment.Never -> false
+    }
+
+    private fun momentsOf(key: String, p: PlacementWire): List<Pair<MomentId, ShowWhenMoment>> {
+        val out = ArrayList<Pair<MomentId, ShowWhenMoment>>()
+        p.items.forEach { out.add(itemMoment(key, it) to it.showWhen) }
+        if (p.isControl) out.add(controlMoment(key, p) to p.showWhen)
+        p.deferredControls.forEach { out.add(MomentId(MomentKind.DEFERRED, key, it.controlToken) to it.showWhen) }
+        return out
+    }
+
+    /**
+     * Lock held. Marks every moment reached now; returns the keys whose
+     * Placement changed (an item revealed, a control answer's moment came).
+     */
+    private fun updateMomentsLocked(): List<String> {
+        val changed = ArrayList<String>()
+        for ((key, entry) in cache) {
+            for ((id, moment) in momentsOf(key, entry.placement)) {
+                if (moment == ShowWhenMoment.Load || id in revealed || !reachedLocked(moment)) continue
+                revealed.add(id)
+                if (id.kind != MomentKind.DEFERRED && key !in changed) changed.add(key)
+            }
+        }
+        return changed
+    }
+
+    /** The seconds moments' timer fired (tests call it directly). */
+    internal fun checkShowWhen() {
+        val changed = synchronized(lock) { updateMomentsLocked() }
+        if (changed.isNotEmpty()) applyChanged(changed)
+        reportDueDeferredControls()
+        scheduleMomentTimer()
+    }
+
+    /**
+     * A new screen: every moment starts again (content revealed by a non-load
+     * moment is held again until the new screen's moment; an event of this
+     * visit still counts at once).
+     */
+    private fun screenChanged() {
+        val changed = synchronized(lock) {
+            val before = HashSet(revealed)
+            revealed.clear()
+            viewedOnScreen.clear()
+            rechecked.clear()
+            pendingRechecks.clear()
+            updateMomentsLocked()
+            ((before - revealed) + (revealed - before)).filter { it.kind != MomentKind.DEFERRED }.map { it.key }.distinct()
+        }
+        if (changed.isNotEmpty()) applyChanged(changed)
+        scheduleMomentTimer()
+    }
+
+    private fun stopMomentTimer() {
+        val cancel = synchronized(lock) { cancelMomentTimer.also { cancelMomentTimer = null } }
+        cancel?.invoke()
+    }
+
+    /** One timer for the nearest `seconds` moment not reached yet (none while in the background). */
+    private fun scheduleMomentTimer() {
+        stopMomentTimer()
+        val waitMs = synchronized(lock) {
+            if (!screenClock.isVisible) return@synchronized null
+            val elapsed = screenClock.seconds
+            var next: Double? = null
+            for ((key, entry) in cache) {
+                for ((id, moment) in momentsOf(key, entry.placement)) {
+                    if (moment !is ShowWhenMoment.Seconds || id in revealed) continue
+                    val w = maxOf(0.0, moment.seconds - elapsed)
+                    next = minOf(next ?: w, w)
+                }
+            }
+            next?.let { (it * 1000).toLong() + 50 }
+        } ?: return
+        val run = { checkShowWhen() }
+        val cancel = schedule?.invoke(waitMs, run) ?: scope.launch { delay(waitMs); run() }.let { job -> { job.cancel() } }
+        synchronized(lock) { cancelMomentTimer = cancel }
     }
 
     private fun subject(o: JsonObject) {
@@ -538,6 +865,14 @@ internal class PlacementManager(
             controlToken = o.str("controlToken"),
             items = items,
             json = o,
+            showWhen = if (o.bool("isControl") == true) ShowWhenMoment.parse(o.get("showWhen")) else ShowWhenMoment.Load,
+            deferredControls = (o.get("deferredControls")?.takeIf { it.isJsonArray }?.asJsonArray ?: JsonArray()).mapNotNull { d ->
+                val dc = d.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+                val token = dc.str("controlToken")?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+                DeferredControl(token, ShowWhenMoment.parse(dc.get("showWhen")))
+            },
+            recheckOn = (o.get("recheckOn")?.takeIf { it.isJsonArray }?.asJsonArray ?: JsonArray())
+                .mapNotNull { e -> e.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString?.takeIf { it.isNotEmpty() } },
         )
     }
 
@@ -592,6 +927,7 @@ internal class PlacementManager(
             triggerWindowSeconds = o.int("placementTriggerWindowSeconds"),
             expiresAt = o.str("expiresAt"),
             json = o,
+            showWhen = ShowWhenMoment.parse(o.get("showWhen")),
         )
     }
 
@@ -632,6 +968,10 @@ internal class PlacementManager(
     }
 
     companion object {
+        /** Pending re-checks kept at most (oldest dropped) and for at most this long. */
+        internal const val PENDING_RECHECK_MAX = 20
+        internal const val PENDING_RECHECK_MAX_AGE_MS = 60_000L
+
         private val KEY_PATTERN = Regex("^[a-z0-9][a-z0-9_]{0,63}$")
         private const val DEFAULT_TTL_SECONDS = 300
         private val GENERIC_ELEMENT_IDS = setOf("click", "clicked", "button", "link", "cta_click", "link_click", "button_click")

@@ -27,6 +27,10 @@ internal class ScreenClock(
     private var accumulatedMs = 0L
     private var visibleSinceMs: Long? = if (visible) now() else null
     private val fired = mutableSetOf<String>()
+    private val observers = ArrayList<(Change) -> Unit>()
+
+    /** What moved the clock - for the placements' "Show when" (PlacementManager). */
+    enum class Change { SCREEN, PAUSED, RESUMED }
 
     /** The current screen's name, null before the first trackScreen. */
     val name: String? @Synchronized get() = currentName
@@ -38,27 +42,49 @@ internal class ScreenClock(
         @Synchronized get() = (accumulatedMs + (visibleSinceMs?.let { now() - it } ?: 0L)) / 1000.0
 
     /** The app reported a screen. True when it is a different screen (the clock restarted). */
-    @Synchronized
     fun enter(screenName: String): Boolean {
         val next = screenName.trim()
         if (next.isEmpty()) return false
-        if (currentName?.lowercase() == next.lowercase()) return false
-        currentName = next
-        accumulatedMs = 0L
-        if (visibleSinceMs != null) visibleSinceMs = now()
-        fired.clear()
-        return true
+        val changed = synchronized(this) {
+            if (currentName?.lowercase() == next.lowercase()) {
+                false
+            } else {
+                currentName = next
+                accumulatedMs = 0L
+                if (visibleSinceMs != null) visibleSinceMs = now()
+                fired.clear()
+                true
+            }
+        }
+        if (changed) notify(Change.SCREEN)
+        return changed
     }
 
-    @Synchronized
     fun pause() {
-        visibleSinceMs?.let { accumulatedMs += now() - it }
-        visibleSinceMs = null
+        val was = synchronized(this) {
+            val since = visibleSinceMs
+            if (since != null) accumulatedMs += now() - since
+            visibleSinceMs = null
+            since != null
+        }
+        if (was) notify(Change.PAUSED)
     }
 
-    @Synchronized
     fun resume() {
-        if (visibleSinceMs == null) visibleSinceMs = now()
+        val started = synchronized(this) {
+            if (visibleSinceMs == null) { visibleSinceMs = now(); true } else false
+        }
+        if (started) notify(Change.RESUMED)
+    }
+
+    /** Called after every new screen, pause and resume (outside the clock's lock). */
+    fun observe(observer: (Change) -> Unit) {
+        synchronized(this) { observers.add(observer) }
+    }
+
+    private fun notify(change: Change) {
+        val all = synchronized(this) { observers.toList() }
+        all.forEach { runCatching { it(change) } }
     }
 
     @Synchronized

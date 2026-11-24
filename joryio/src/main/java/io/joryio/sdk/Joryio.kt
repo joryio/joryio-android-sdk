@@ -882,7 +882,13 @@ class Joryio private constructor(
             },
             postMain = { r -> Handler(Looper.getMainLooper()).post(r) },
             log = { logger.debug(it) },
+            // "Show when" (D465): `seconds` counts on the time_on_screen clock;
+            // an event re-check goes only after its event has left the queue.
+            screenClock = inAppMessagingManager.screenClock,
+            deliverEvent = { queueManager.deliver(it) },
+            isEventQueued = { queueManager.isQueued(it) },
         )
+        queueManager.afterFlush = { placementManager.onEventsFlushed() }
 
         cardManager = io.joryio.sdk.cards.CardManager(
             transport = object : io.joryio.sdk.cards.CardTransport {
@@ -1323,7 +1329,7 @@ class Joryio private constructor(
         // the insert must still discard this event.
         val queueGeneration = queueManager.generation
 
-        scope.launch {
+        val enqueued = scope.launch {
             try {
                 queueManager.enqueue(event, queueGeneration)
                 sessionManager.updateActivity()
@@ -1344,7 +1350,8 @@ class Joryio private constructor(
         // or not it triggers a message.
         try {
             inAppMessagingManager.onEventTracked(eventName, props)
-            placementManager.onEventTracked(eventName, props)
+            // A Show when re-check runs once THIS event is queued, then sent.
+            placementManager.onEventTracked(eventName, props, event) { enqueued.join() }
             // A screen view also moves the time_on_screen clock (ScreenClock.kt) -
             // from the event, so a trackScreen held before initialize() and a
             // hand-written track("Screen Viewed") count too.

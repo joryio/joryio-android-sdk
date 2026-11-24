@@ -40,6 +40,10 @@ internal interface EventDao {
     @Query("SELECT DISTINCT userId FROM events WHERE userId IS NOT NULL")
     suspend fun queuedUserIds(): List<String>
 
+    /** Is this event (its client eventId) still queued - not sent yet? (a "Show when" re-check waits for it) */
+    @Query("SELECT COUNT(*) FROM events WHERE eventId = :eventId")
+    suspend fun countByEventId(eventId: String): Int
+
     /** Get queue size. */
     @Query("SELECT COUNT(*) FROM events")
     suspend fun getCount(): Int

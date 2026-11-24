@@ -86,6 +86,7 @@ class PlacementManagerTest {
         assertEquals("android", body.get("deviceType").asString)
         assertEquals("granted", body.get("trackingConsent").asString)
         assertEquals(listOf("placements", "content.native", "content.data"), body.getAsJsonArray("capabilities").map { it.asString })
+        assertFalse("only a Show when re-check carries an event", body.has("recheckEvent"))
         val item = a!!["home_hero"]!!.items.single()
         assertEquals("camp-1", item.id)
         assertEquals("Free shipping today", item.data["headline"])
@@ -332,5 +333,356 @@ class PlacementManagerTest {
         assertFalse(PlacementManager.triggerMatches(mapOf("attribute" to "a", "operator" to "regex", "value" to "x"), mapOf("a" to "x")))
         assertTrue(PlacementManager.triggerMatches(mapOf("attribute" to "a", "value" to 2), mapOf("a" to 2.0)))
         assertNull(PlacementManager.parseIso("not a date"))
+    }
+
+    // ── Show when (BACKLOG D465) ────────────────────────────────────────
+
+    private var session = "s-1"
+    private val delivered = Collections.synchronizedList(ArrayList<String>())
+    @Volatile private var deliverAnswer = true
+    @Volatile private var stillQueued = setOf<String>()
+    private val scheduled = Collections.synchronizedList(ArrayList<Long>())
+
+    private fun swManager(transport: FakeTransport, screen: io.joryio.sdk.messaging.ScreenClock) = PlacementManager(
+        transport = transport,
+        store = null,
+        consent = { consentValue },
+        userId = { user },
+        anonymousId = { "anon-1" },
+        sessionId = { session },
+        capabilities = { listOf("placements", "content.native", "content.data") },
+        locale = { "he-IL" },
+        postMain = { it.run() },
+        now = { clock },
+        screenClock = screen,
+        deliverEvent = { delivered.add(it); deliverAnswer },
+        isEventQueued = { it in stillQueued },
+        schedule = { ms, _ -> scheduled.add(ms); {} },
+    )
+
+    private fun screenClock() = io.joryio.sdk.messaging.ScreenClock(now = { clock })
+
+    private fun sw(json: String) = ""","showWhen":$json"""
+
+    private fun controls(t: FakeTransport) =
+        t.tracks.toList().filter { it.get("action").asString == "control_viewed" }.map { it.get("controlToken").asString }
+
+    @Test
+    fun showWhenConstantsAreTheWireValues() {
+        assertEquals(listOf("load", "seconds", "scroll", "exit", "event"), SHOW_WHEN_KINDS)
+        fun p(json: String?) = ShowWhenMoment.parse(json?.let { JsonParser.parseString(it) })
+        assertEquals(ShowWhenMoment.Load, p(null))
+        assertEquals(ShowWhenMoment.Load, p("""{"kind":"load"}"""))
+        assertEquals(ShowWhenMoment.Seconds(5.0), p("""{"kind":"seconds","seconds":5}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"seconds","seconds":0}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"seconds","seconds":2.5}"""))
+        assertEquals(ShowWhenMoment.Event("add_to_cart"), p("""{"kind":"event","event":" add_to_cart "}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"event","event":""}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"scroll","percent":50}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"exit"}"""))
+        assertEquals(ShowWhenMoment.Never, p("""{"kind":"later"}"""))
+        assertEquals(ShowWhenMoment.Never, p("\"load\""))
+    }
+
+    /** No capability: placements exist only in the 1.4.0 betas (owner decision). */
+    @Test
+    fun theRequestDeclaresNoShowWhenCapability() = runBlocking {
+        val t = FakeTransport { answer(hero()) }
+        swManager(t, screenClock()).getPlacements(listOf("home_hero"))
+        assertFalse(t.fetches[0].getAsJsonArray("capabilities").any { it.asString == "show_when" })
+    }
+
+    private fun ev(name: String, props: Map<String, Any?> = emptyMap()) =
+        io.joryio.sdk.models.Event(type = name, properties = props, anonymousId = "anon-1", sessionId = session)
+
+    @Test
+    fun secondsOnScreenHoldsThenRevealsPausesInTheBackgroundAndRestartsOnANewScreen() = runBlocking {
+        val screen = screenClock()
+        val t = FakeTransport { answer(hero(item(extra = sw("""{"kind":"seconds","seconds":10}""")))) }
+        val m = swManager(t, screen)
+        val updates = ArrayList<Int>()
+        m.onPlacementsUpdated { updates.add(it["home_hero"]?.items?.size ?: -1) }
+        val first = m.getPlacements(listOf("home_hero"))
+        assertTrue("held until its moment", first["home_hero"]!!.items.isEmpty())
+        assertEquals(10_050L, scheduled.last())
+
+        clock += 4_000
+        screen.pause() // background time does not count
+        clock += 100_000
+        screen.resume()
+        m.checkShowWhen()
+        assertTrue(m.toPlacement("home_hero").items.isEmpty())
+        clock += 6_000
+        m.checkShowWhen()
+        val shown = m.toPlacement("home_hero")
+        assertEquals(1, shown.items.size)
+        assertEquals("onPlacementsUpdated at the moment", 1, updates.last())
+        shown.items[0].markDisplayed()
+        waitUntil { t.tracks.isNotEmpty() }
+        assertEquals("displayed", t.tracks[0].get("action").asString)
+
+        // A new screen: held again until 10 s on it.
+        screen.enter("Cart")
+        assertTrue(m.toPlacement("home_hero").items.isEmpty())
+        assertEquals(0, updates.last())
+        clock += 10_000
+        m.checkShowWhen()
+        assertEquals(1, m.toPlacement("home_hero").items.size)
+        assertEquals(1, t.fetches.size)
+    }
+
+    @Test
+    fun anImpressionIsNeverCountedWhileHeld() = runBlocking {
+        val t = FakeTransport { answer(hero(item(extra = sw("""{"kind":"seconds","seconds":10}""")))) }
+        val m = swManager(t, screenClock())
+        m.getPlacements(listOf("home_hero"))
+        val wire = JsonParser.parseString(item(extra = sw("""{"kind":"seconds","seconds":10}"""))).asJsonObject
+        val held = PlacementItem("camp-1", "v2", "native", emptyMap(), null, emptyList(), null, null, "home_hero",
+            PlacementItemWire("camp-1", "v2", "tok-camp-1", null, null, "native", emptyMap(), null, emptyList(), emptyList(), null, null, wire, ShowWhenMoment.Seconds(10.0)),
+            m)
+        held.markDisplayed()
+        Thread.sleep(100)
+        assertTrue(t.tracks.isEmpty())
+    }
+
+    @Test
+    fun scrollExitAndUnknownKindsAreNeverShownInAnApp() = runBlocking {
+        val items = listOf(
+            item("a", sw("""{"kind":"scroll","percent":50}""")),
+            item("b", sw("""{"kind":"exit"}""")),
+            item("c", sw("""{"kind":"hover"}""")),
+            item("d", sw("""{"kind":"seconds","seconds":99999}""")),
+        ).joinToString(",")
+        val t = FakeTransport { answer(""""home_hero":{"placementKey":"home_hero","maxItems":4,"items":[$items]}""") }
+        val m = swManager(t, screenClock())
+        m.getPlacements(listOf("home_hero"))
+        clock += 4_000_000
+        m.onEventTracked("anything", emptyMap())
+        m.checkShowWhen()
+        assertTrue(m.toPlacement("home_hero").items.isEmpty())
+    }
+
+    @Test
+    fun anEventOfThisVisitRevealsAndReChecksTheKeyAtOncePastTheLimitOncePerScreen() = runBlocking {
+        val screen = screenClock()
+        val t = FakeTransport { answer(hero(item(extra = sw("""{"kind":"event","event":"add_to_cart"}""")), extra = ""","recheckOn":["add_to_cart","wishlist"]""")) }
+        val m = swManager(t, screen)
+        m.getPlacements(listOf("home_hero"))
+        assertTrue(m.toPlacement("home_hero").items.isEmpty())
+
+        val cart = ev("add_to_cart", mapOf("sku" to "A-1", "qty" to 2))
+        m.onEventTracked("add_to_cart", cart.properties, cart)
+        assertEquals("the event counts in this visit", 1, m.toPlacement("home_hero").items.size)
+        waitUntil { t.fetches.size == 2 }
+        assertEquals("the event leaves the queue before the re-check", listOf(cart.eventId), delivered.toList())
+        assertEquals("re-fetched inside the 30 s limit", 2, t.fetches.size)
+        val rc = t.fetches[1].getAsJsonObject("recheckEvent")
+        assertEquals("add_to_cart", rc.get("name").asString)
+        assertEquals(cart.eventId, rc.get("eventId").asString)
+        assertEquals("A-1", rc.getAsJsonObject("properties").get("sku").asString)
+        assertEquals(2, rc.getAsJsonObject("properties").get("qty").asInt)
+        assertEquals(listOf("home_hero"), t.fetches[1].getAsJsonArray("placements").map { it.asString })
+
+        m.onEventTracked("add_to_cart", emptyMap(), ev("add_to_cart"))
+        Thread.sleep(300)
+        assertEquals("once per (key, event) per screen", 2, t.fetches.size)
+
+        // recheckOn alone (a campaign the person does not qualify for yet) also re-checks.
+        m.onEventTracked("wishlist", emptyMap(), ev("wishlist"))
+        waitUntil { t.fetches.size == 3 }
+        assertEquals(3, t.fetches.size)
+
+        // A new screen: the visit's event still counts at once; the re-check may run again.
+        screen.enter("Cart")
+        assertEquals(1, m.toPlacement("home_hero").items.size)
+        m.onEventTracked("wishlist", emptyMap(), ev("wishlist"))
+        waitUntil { t.fetches.size == 4 }
+        assertEquals(4, t.fetches.size)
+
+        // A new visit (session) starts the event set over.
+        session = "s-2"
+        screen.enter("Home")
+        assertTrue(m.toPlacement("home_hero").items.isEmpty())
+    }
+
+    @Test
+    fun anEventTrackedBeforeTheAnswerArrivedShowsTheItemAtOnce() = runBlocking {
+        val t = FakeTransport { answer(hero(item(extra = sw("""{"kind":"event","event":"signup"}""")))) }
+        val m = swManager(t, screenClock())
+        m.onEventTracked("signup", emptyMap())
+        assertEquals(1, m.getPlacements(listOf("home_hero"))["home_hero"]!!.items.size)
+    }
+
+    /**
+     * The flush failed (the event is still queued): no re-check now; once - and
+     * only once - after a later flush that sent it.
+     */
+    @Test
+    fun aReCheckWhoseEventIsStillQueuedRunsOnceAfterTheNextSuccessfulFlush() = runBlocking {
+        val t = FakeTransport { answer(hero(item(extra = sw("""{"kind":"event","event":"add_to_cart"}""")))) }
+        val m = swManager(t, screenClock())
+        m.getPlacements(listOf("home_hero"))
+        deliverAnswer = false
+        val cart = ev("add_to_cart")
+        stillQueued = setOf(cart.eventId)
+        var queuedFirst = false
+        m.onEventTracked("add_to_cart", emptyMap(), cart) { queuedFirst = true }
+        waitUntil { delivered.isNotEmpty() }
+        Thread.sleep(200)
+        assertTrue("the event's insert is awaited first", queuedFirst)
+        assertEquals("never before the server has the event", 1, t.fetches.size)
+        m.onEventsFlushed() // a flush that failed again: still queued
+        Thread.sleep(200)
+        assertEquals(1, t.fetches.size)
+        stillQueued = emptySet()
+        m.onEventsFlushed() // the next successful flush
+        waitUntil { t.fetches.size == 2 }
+        assertEquals(cart.eventId, t.fetches[1].getAsJsonObject("recheckEvent").get("eventId").asString)
+        m.onEventsFlushed()
+        Thread.sleep(200)
+        assertEquals("once", 2, t.fetches.size)
+    }
+
+    private fun recheckHero(names: List<String> = listOf("add_to_cart")) =
+        FakeTransport { answer(hero(extra = ""","recheckOn":[${names.joinToString(",") { "\"$it\"" }}]""")) }
+
+    /** A pending re-check (its event still queued) for a placement that waits on [names]. */
+    private fun pendingManager(t: FakeTransport, names: List<String> = listOf("add_to_cart")): Pair<PlacementManager, io.joryio.sdk.messaging.ScreenClock> = runBlocking {
+        val screen = screenClock()
+        val m = swManager(t, screen)
+        m.getPlacements(listOf("home_hero"))
+        deliverAnswer = false
+        val ids = HashSet(stillQueued)
+        for (n in names) {
+            val e = ev(n)
+            ids.add(e.eventId)
+            stillQueued = HashSet(ids)
+            m.onEventTracked(n, emptyMap(), e)
+            Thread.sleep(30) // in order: "oldest" is well defined
+        }
+        waitUntil { m.pendingRecheckCount == minOf(names.size, PlacementManager.PENDING_RECHECK_MAX) && delivered.size >= names.size }
+        Thread.sleep(100)
+        m to screen
+    }
+
+    @Test
+    fun aPendingReCheckIsDroppedAfterAnIdentitySwitch() {
+        val t = recheckHero()
+        val (m, _) = pendingManager(t)
+        assertEquals(1, m.pendingRecheckCount)
+        user = "someone-else"
+        stillQueued = emptySet()
+        m.onEventsFlushed()
+        Thread.sleep(300)
+        assertEquals("never runs for another person", 1, t.fetches.size)
+        assertEquals(0, m.pendingRecheckCount)
+    }
+
+    @Test
+    fun aPendingReCheckIsDroppedOnReset() {
+        val t = recheckHero()
+        val (m, _) = pendingManager(t)
+        m.invalidate()
+        assertEquals(0, m.pendingRecheckCount)
+        stillQueued = emptySet()
+        m.onEventsFlushed()
+        Thread.sleep(300)
+        assertEquals(1, t.fetches.size)
+    }
+
+    @Test
+    fun aPendingReCheckIsDroppedWhenConsentIsWithdrawn() {
+        val t = recheckHero()
+        val (m, _) = pendingManager(t)
+        consentValue = "denied"
+        stillQueued = emptySet()
+        m.onEventsFlushed()
+        Thread.sleep(300)
+        assertEquals(1, t.fetches.size)
+        assertEquals(0, m.pendingRecheckCount)
+    }
+
+    @Test
+    fun aPendingReCheckIsDroppedOnANewScreenAndAfterSixtySeconds() {
+        val (m, screen) = pendingManager(recheckHero())
+        screen.enter("Cart")
+        assertEquals("a new screen", 0, m.pendingRecheckCount)
+
+        val t2 = recheckHero()
+        val (m2, _) = pendingManager(t2)
+        assertEquals(1, m2.pendingRecheckCount)
+        clock += 61_000
+        stillQueued = emptySet()
+        m2.onEventsFlushed()
+        Thread.sleep(300)
+        assertEquals("older than 60 s", 1, t2.fetches.size)
+        assertEquals(0, m2.pendingRecheckCount)
+        assertEquals(60_000L, PlacementManager.PENDING_RECHECK_MAX_AGE_MS)
+    }
+
+    @Test
+    fun pendingReChecksAreCappedAtTwentyOldestDropped() {
+        val names = (0 until 25).map { "e$it" }
+        val t = recheckHero(names)
+        val (m, _) = pendingManager(t, names)
+        assertEquals(20, m.pendingRecheckCount)
+        stillQueued = emptySet()
+        m.onEventsFlushed()
+        waitUntil { t.fetches.size == 21 }
+        Thread.sleep(200)
+        val sentNames = t.fetches.drop(1).map { it.getAsJsonObject("recheckEvent").get("name").asString }
+        assertEquals("the oldest five were dropped", names.takeLast(20).toSet(), sentNames.toSet())
+    }
+
+    @Test
+    fun aControlAnswerReportsControlViewedOnlyAfterItsMoment() = runBlocking {
+        val t = FakeTransport { answer(""""home_hero":{"placementKey":"home_hero","isControl":true,"controlToken":"ctl-1","items":[],"showWhen":{"kind":"seconds","seconds":5}}""") }
+        val m = swManager(t, screenClock())
+        var heard = 0
+        m.onPlacementsUpdated { heard++ }
+        val p = m.getPlacements(listOf("home_hero"))["home_hero"]!!
+        val before = heard
+        p.markDisplayed()
+        Thread.sleep(100)
+        assertTrue("ignored before the moment", t.tracks.isEmpty())
+        clock += 5_000
+        m.checkShowWhen()
+        assertEquals("onPlacementsUpdated at the moment", before + 1, heard)
+        m.toPlacement("home_hero").markDisplayed()
+        m.toPlacement("home_hero").markDisplayed()
+        waitUntil { t.tracks.isNotEmpty() }
+        Thread.sleep(100)
+        assertEquals(listOf("ctl-1"), controls(t))
+        assertEquals(1, t.tracks.size)
+    }
+
+    @Test
+    fun deferredControlsAreReportedOnceAtTheirMomentOnAViewedSpot() = runBlocking {
+        val screen = screenClock()
+        val deferred = ""","deferredControls":[{"controlToken":"ctl-late","showWhen":{"kind":"seconds","seconds":8}},{"controlToken":"ctl-load","showWhen":{"kind":"load"}},{"controlToken":"ctl-scroll","showWhen":{"kind":"scroll","percent":50}}]"""
+        val t = FakeTransport { answer(hero(extra = deferred)) }
+        val m = swManager(t, screen)
+        val p = m.getPlacements(listOf("home_hero"))["home_hero"]!!
+        Thread.sleep(100)
+        assertTrue("not before the spot was viewable", t.tracks.isEmpty())
+        p.items[0].markDisplayed()
+        waitUntil { controls(t).isNotEmpty() }
+        assertEquals(listOf("ctl-load"), controls(t))
+        clock += 8_000
+        m.checkShowWhen()
+        waitUntil { controls(t).size == 2 }
+        assertEquals(setOf("ctl-load", "ctl-late"), controls(t).toSet())
+        val body = t.tracks.first { it.get("controlToken")?.asString == "ctl-late" }
+        assertEquals("home_hero", body.get("placementKey").asString)
+        assertEquals("anon-1", body.get("anonymousId").asString)
+        assertEquals("android", body.get("deviceType").asString)
+        assertTrue(body.has("viewedAt"))
+        // Once each, also on a new screen.
+        screen.enter("Cart")
+        clock += 8_000
+        m.toPlacement("home_hero").markDisplayed()
+        m.checkShowWhen()
+        Thread.sleep(150)
+        assertEquals(2, controls(t).size)
     }
 }

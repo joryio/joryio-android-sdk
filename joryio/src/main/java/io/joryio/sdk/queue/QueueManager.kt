@@ -209,6 +209,10 @@ internal class QueueManager(
     /** Sends one batch and reports what the server said. */
     var onFlush: (suspend (EventBatch) -> BatchSendResult)? = null
 
+    /** Called after every flush that ran (not one skipped): "Show when" re-checks waiting for their event. */
+    @Volatile
+    var afterFlush: () -> Unit = {}
+
     /**
      * Row count of the events table, refreshed after every write.
      *
@@ -341,7 +345,28 @@ internal class QueueManager(
         } finally {
             flushMutex.unlock()
         }
+        runCatching { afterFlush() }
     }
+
+    /**
+     * A "Show when" re-check (D465) must not reach the server before its event:
+     * true once the event (its client eventId) has left the queue - sent by the
+     * flush in flight (waited for) or by one more. False while it is still
+     * queued (a failure, a backoff, sending paused): the caller waits for the
+     * next flush ([afterFlush]).
+     */
+    suspend fun deliver(eventId: String): Boolean {
+        repeat(3) {
+            if (!isQueued(eventId)) return true
+            flushMutex.withLock { } // the flush in flight, if any, ends first
+            flush()
+        }
+        return !isQueued(eventId)
+    }
+
+    /** Is this event still queued? An error answers true (the re-check waits rather than run early). */
+    suspend fun isQueued(eventId: String): Boolean =
+        try { eventDao.countByEventId(eventId) > 0 } catch (e: Exception) { true }
 
     /**
      * The leading events that belong to ONE user (contract item 30). A batch

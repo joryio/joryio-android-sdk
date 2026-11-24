@@ -36,6 +36,53 @@ const val PLACEMENT_PRODUCT_CARD_WIDTH: Int = 160
 /** The elementId a product card's click is reported with - use it when you draw the cards yourself. */
 fun placementProductElementId(productId: String): String = (PLACEMENT_PRODUCT_ELEMENT_PREFIX + productId).take(128)
 
+/**
+ * "Show when" (BACKLOG D465): the moment a placement campaign's content is
+ * revealed on a screen - the `kind` values the wire may carry. An app honours
+ * `load`, `seconds` (foreground seconds on the screen) and `event` (tracked in
+ * this visit); `scroll` and `exit` are web-only and, like an unknown kind, are
+ * never shown.
+ */
+val SHOW_WHEN_KINDS: List<String> = listOf("load", "seconds", "scroll", "exit", "event")
+
+/**
+ * A served "Show when" as an app honours it. Wire contract:
+ * packages/backend/src/common/show-when.ts - `{ kind: 'load' }` (also: no
+ * field), `{ kind: 'seconds', seconds: 1..3600 }`, `{ kind: 'event', event }`;
+ * `scroll` / `exit` (web only), an unknown kind or an invalid value become
+ * [Never]: such content is not shown at all (never treated as `load`).
+ */
+internal sealed class ShowWhenMoment {
+    object Load : ShowWhenMoment()
+    /** Foreground seconds on the current screen (the time_on_screen clock). */
+    data class Seconds(val seconds: Double) : ShowWhenMoment()
+    /** The event was tracked in this visit (the SDK session). */
+    data class Event(val event: String) : ShowWhenMoment()
+    object Never : ShowWhenMoment()
+
+    companion object {
+        fun parse(raw: com.google.gson.JsonElement?): ShowWhenMoment {
+            if (raw == null || raw.isJsonNull) return Load
+            if (!raw.isJsonObject) return Never
+            val o = raw.asJsonObject
+            val kind = o.get("kind")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+            return when (kind) {
+                "load" -> Load
+                "seconds" -> {
+                    val n = o.get("seconds")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asDouble
+                    if (n != null && n == Math.floor(n) && n >= 1 && n <= 3600) Seconds(n) else Never
+                }
+                "event" -> {
+                    val e = o.get("event")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString?.trim().orEmpty()
+                    if (e.isNotEmpty() && e.length <= 255) Event(e) else Never
+                }
+                // scroll / exit need a page; anything else is unknown.
+                else -> Never
+            }
+        }
+    }
+}
+
 /** What the spot does when nothing is eligible: the wire values. */
 object PlacementEmptyBehavior {
     const val COLLAPSE = "collapse"
