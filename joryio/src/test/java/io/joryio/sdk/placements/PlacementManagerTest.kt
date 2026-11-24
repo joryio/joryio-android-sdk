@@ -676,6 +676,52 @@ class PlacementManagerTest {
         assertEquals("the five tracked first were dropped", names.takeLast(20).toSet(), sentNames.toSet())
     }
 
+    /**
+     * 1.4.0-beta.10 test (RN shop app): /track/batch failing, m1..m25 tracked,
+     * flush, restore, flush. The deliveries waited behind the failing flush and
+     * then SUCCEEDED - they never went through the capped waiting list, so all
+     * 25 re-checks ran. Only the 20 tracked last may run, as on iOS and the web.
+     */
+    @Test
+    fun deliveriesQueuedBehindAFailingFlushThatSucceedLaterStillHonourTheCapOfTwenty() {
+        val names = (1..25).map { "m$it" }
+        val t = recheckHero(names)
+        val events = names.map { ev(it) }
+        val restored = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val m = PlacementManager(
+            transport = t,
+            store = null,
+            consent = { consentValue },
+            userId = { user },
+            anonymousId = { "anon-1" },
+            sessionId = { session },
+            capabilities = { listOf("placements", "content.native", "content.data") },
+            locale = { "he-IL" },
+            postMain = { it.run() },
+            now = { clock },
+            screenClock = screenClock(),
+            // Each delivery waits behind the failing flush, then succeeds once it is restored.
+            deliverEvent = { id -> delivered.add(id); restored.await(); true },
+            isEventQueued = { it in stillQueued },
+            schedule = { ms, _ -> scheduled.add(ms); {} },
+        )
+        runBlocking { m.getPlacements(listOf("home_hero")) }
+        stillQueued = events.map { it.eventId }.toSet()
+        names.zip(events).forEach { (n, e) -> m.onEventTracked(n, emptyMap(), e) }
+        waitUntil { delivered.size >= names.size }
+        assertEquals(20, m.pendingRecheckCount)
+        assertEquals("nothing before the server has the events", 1, t.fetches.size)
+        stillQueued = emptySet()
+        restored.complete(Unit)
+        m.onEventsFlushed() // the restored flush also reports in
+        waitUntil { t.fetches.size >= 21 }
+        Thread.sleep(300)
+        assertEquals("20 re-checks, not 25", 21, t.fetches.size)
+        val sentNames = t.fetches.drop(1).map { it.getAsJsonObject("recheckEvent").get("name").asString }
+        assertEquals("m6..m25, each once", names.takeLast(20).sorted(), sentNames.sorted())
+        assertEquals(0, m.pendingRecheckCount)
+    }
+
     @Test
     fun aControlAnswerReportsControlViewedOnlyAfterItsMoment() = runBlocking {
         val t = FakeTransport { answer(""""home_hero":{"placementKey":"home_hero","isControl":true,"controlToken":"ctl-1","items":[],"showWhen":{"kind":"seconds","seconds":5}}""") }

@@ -97,6 +97,17 @@ internal class IdentityManager(
         storage.setAnonymousId(anonymousId ?: java.util.UUID.randomUUID().toString())
     }
 
+    /**
+     * identify() of a DIFFERENT user: the in-memory trait bag is the previous
+     * user's, not the next one's (as on iOS and the web). It used to stay, so
+     * user A's `seats` / `ratio` rode in user B's flags evaluate and in-app
+     * sync (1.4.0-beta.10 test). Their unsent writes are sealed under their own
+     * ids first (Joryio.identify).
+     */
+    fun clearTraitBag() {
+        attributes.clear()
+    }
+
     // MARK: - User Attributes (in-memory only — never persisted)
 
     fun getUserAttributes(): UserAttributes {

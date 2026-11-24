@@ -50,6 +50,17 @@ internal class NetworkClient(
     private val okHttpClient: OkHttpClient
 
     /**
+     * The same client, but a request that lost its connection is NOT sent a
+     * second time by OkHttp ([OkHttpClient.Builder.retryOnConnectionFailure],
+     * on by default). For the calls documented "ONCE" - flags and placements:
+     * a POST whose connection dropped after the server read it was silently
+     * sent again, so every flag exposure in that request was counted twice
+     * (the 1.4.0-beta.10 test, Android only - iOS's URLSession does not
+     * re-send a POST, and neither does the browser).
+     */
+    private val onceApi: JoryioApi
+
+    /**
      * `Joryio-Android/<sdk> (<package>; Android <release>)` — an app-shaped
      * User-Agent, so we are never mistaken for a scripted HTTP client. Built
      * defensively: a Context that cannot report its package name must not stop
@@ -240,6 +251,10 @@ internal class NetworkClient(
             .build()
 
         api = retrofit.create(JoryioApi::class.java)
+        onceApi = retrofit.newBuilder()
+            .client(okHttpClient.newBuilder().retryOnConnectionFailure(false).build())
+            .build()
+            .create(JoryioApi::class.java)
         logger.debug("NetworkClient initialized with base URL: $normalizedBaseUrl")
     }
 
@@ -749,7 +764,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = api.postFlags(path, body)
+            val response = onceApi.postFlags(path, body)
             if (response.isSuccessful) response.body()?.string() else null
         } catch (e: Exception) {
             logger.debug("Flags request failed: ${e.message}")
@@ -792,7 +807,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext 0 to null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = api.fetchPlacements(body)
+            val response = onceApi.fetchPlacements(body)
             response.code() to (if (response.isSuccessful) response.body()?.string() else null)
         } catch (e: Exception) {
             logger.debug("Placements request failed: ${e.message}")
@@ -809,7 +824,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext 0 to null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = api.fetchCards(body)
+            val response = onceApi.fetchCards(body)
             response.code() to (if (response.isSuccessful) response.body()?.string() else null)
         } catch (e: Exception) {
             logger.debug("Card feed request failed: ${e.message}")

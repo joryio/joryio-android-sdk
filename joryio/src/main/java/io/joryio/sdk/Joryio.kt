@@ -1422,6 +1422,9 @@ class Joryio private constructor(
                 // under the new user: A's traits on B's profile, and A's
                 // queued writes with B's token, refused and dropped.
                 sealPendingAttributesLocked()
+                // ...and their attributes are not the next user's: cleared before
+                // any request for the new user (flags, in-app sync), as on iOS.
+                identityManager.clearTraitBag()
                 identityGeneration++
                 networkClient.retireSdkAuthenticationTokenOnSwitch(before, userId)
             }

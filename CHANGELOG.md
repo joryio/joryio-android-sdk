@@ -2,6 +2,12 @@
 
 ## 1.4.0 - 2026-11-18
 
+Fixed (1.4.0-beta.11): Show when - at most 20 re-checks run for events tracked while the event queue could not send, the 20 tracked last, each once. A re-check entered the capped waiting list only when its delivery returned "still queued"; deliveries that waited behind a failing flush and then succeeded ran their re-check directly, so 25 events tracked during an outage sent 25 re-checks where iOS and the web send 20. Every re-check is now registered in the capped list when its event is tracked, and runs only if it is still there when the event is delivered. The 60 s limit and the person / consent stamp are unchanged.
+
+Fixed (1.4.0-beta.11): `identify()` of a different user clears the attributes set for the previous user before any request for the new one, as on iOS and the web. User A's attributes stayed in memory, so `seats` and `ratio` set for A rode in every flags evaluate and in-app sync of user B. Their unsent attribute writes still go out under A's ids. Identifying the same user again keeps them; `reset()` clears them, as before.
+
+Fixed (1.4.0-beta.11): flag exposures were sometimes counted twice. When the connection dropped after the server had read a request, OkHttp sent the same POST again on its own, so every exposure in it reached the server twice. Flags (evaluate, exposures), placements and cards requests - documented as sent once - now go once, as on iOS and the web.
+
 Fixed (1.4.0-beta.10): whole numbers go on the wire as integers. Gson wrote a `Double` such as 3.0 as `3.0` - on `/v1/track/batch`, attributes, flag requests and a placement re-check's `recheckEvent` - where iOS and the web send `3`; React Native hands every JS number to Android as a Double, so `track('x', { n: 3 })` from JS reached the server as 3.0 from Android only. A whole-number Double or Float (up to 2^53) is now written as an integer; a real fraction (3.5) and an `Int` / `Long` are written as before.
 
 Fixed (1.4.0-beta.10): Show when - past 20 waiting re-checks the OLDEST tracked is dropped. Each tracked event re-checks in a coroutine of its own and the waiting list was filled in the order the failed deliveries came back, so a burst could drop the newest instead. Each re-check is now stamped with its tracking order and the list kept in that order, as on iOS.

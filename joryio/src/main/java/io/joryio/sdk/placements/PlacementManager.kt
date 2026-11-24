@@ -165,7 +165,14 @@ internal class PlacementManager(
     /** Event names tracked in the visit [sessionEventsId]. */
     private val sessionEvents = HashSet<String>()
     private var sessionEventsId: String? = null
-    /** Re-checks whose event is still queued (a failed flush): run once after a flush sent it. */
+    /**
+     * Every re-check not run yet, registered when its event is tracked, in
+     * tracking order ([Recheck.seq]); the oldest dropped past
+     * [PENDING_RECHECK_MAX]. A re-check runs only if it is still here when its
+     * event is delivered - whether the delivery returns at once, returns later
+     * (queued behind a failing flush), or a later flush sends it - and leaves
+     * it as it runs, so it runs once. The cap holds by construction (1.4.0-beta.11).
+     */
     private val pendingRechecks = ArrayList<Recheck>()
     /** Answers apply in request order: an older request answering last never overwrites a newer one. */
     private var requestSeq = 0
@@ -186,7 +193,10 @@ internal class PlacementManager(
         val queuedAt: Long,
         /** Tracking order, stamped when the event is tracked: "oldest" past the cap means tracked first. */
         val seq: Long,
-    )
+    ) {
+        /** The event's insert into the queue has finished: a flush that no longer holds it has sent it. */
+        @Volatile var queued = false
+    }
     private var recheckSeq = 0L
     private var cancelMomentTimer: (() -> Unit)? = null
 
@@ -335,6 +345,13 @@ internal class PlacementManager(
         reportDueDeferredControls()
         if (recheck.isNotEmpty()) {
             val rc = Recheck(recheck, event?.eventId, event?.let { recheckEventJson(it) }, subjectKey(), consent(), generation, now(), seq)
+            // Registered now, at track time, in tracking order: past the cap the
+            // OLDEST tracked is dropped, however each delivery later returns.
+            synchronized(lock) {
+                val at = pendingRechecks.indexOfFirst { it.seq > rc.seq }
+                if (at < 0) pendingRechecks.add(rc) else pendingRechecks.add(at, rc)
+                while (pendingRechecks.size > PENDING_RECHECK_MAX) pendingRechecks.removeAt(0)
+            }
             scope.launch {
                 try { beforeRecheck?.invoke() } catch (e: Exception) { log("Queueing before a re-check failed: ${e.message}") }
                 startRecheck(rc)
@@ -344,19 +361,22 @@ internal class PlacementManager(
 
     /** The server must have the event before it answers again. */
     private suspend fun startRecheck(rc: Recheck) {
+        rc.queued = true
         val id = rc.eventId
-        if (id != null && !(try { deliverEvent(id) } catch (e: Exception) { false })) {
-            // Still queued (the flush failed): once, after the next flush that sends it.
-            // Kept in tracking order (each delivery returns in its own time), so the
-            // one dropped past the cap is the OLDEST tracked, as on iOS.
-            synchronized(lock) {
-                val at = pendingRechecks.indexOfFirst { it.seq > rc.seq }
-                if (at < 0) pendingRechecks.add(rc) else pendingRechecks.add(at, rc)
-                while (pendingRechecks.size > PENDING_RECHECK_MAX) pendingRechecks.removeAt(0)
-            }
-            return
-        }
-        runRecheck(rc)
+        // Still queued (the flush failed): it stays registered, and runs once, after
+        // the next flush that sends it - if it has not been dropped by then.
+        if (id != null && !(try { deliverEvent(id) } catch (e: Exception) { false })) return
+        // Delivered (at once, or after waiting behind a failing flush): it runs only
+        // if it is still registered - not dropped past the cap, not already run.
+        if (synchronized(lock) { takeLocked(rc) }) runRecheck(rc)
+    }
+
+    /** Lock held. Takes [rc] out of the waiting list; false if it is no longer there. */
+    private fun takeLocked(rc: Recheck): Boolean {
+        val i = pendingRechecks.indexOfFirst { it === rc }
+        if (i < 0) return false
+        pendingRechecks.removeAt(i)
+        return true
     }
 
     /** The event queue finished a flush: re-checks whose event has left it run now, once. */
@@ -364,12 +384,13 @@ internal class PlacementManager(
         // Too old, or queued for someone else / another consent: dropped, never run.
         val waiting = synchronized(lock) {
             pendingRechecks.removeAll { !stillValidLocked(it) }
-            pendingRechecks.toList()
+            // Only those whose event is in the queue: one still being inserted is not "sent".
+            pendingRechecks.filter { it.queued }
         }
         if (waiting.isEmpty()) return
         scope.launch {
             val due = waiting.filter { rc -> rc.eventId?.let { !(try { isEventQueued(it) } catch (e: Exception) { true }) } ?: true }
-            val taken = synchronized(lock) { due.filter { pendingRechecks.remove(it) } }
+            val taken = synchronized(lock) { due.filter { takeLocked(it) } }
             taken.forEach { runRecheck(it) }
         }
     }
