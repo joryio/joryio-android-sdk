@@ -61,6 +61,28 @@ class FlagsSdkTest {
         assertNull("read before identify: sent as the anonymous visitor", bodies("/v1/flags/exposures")[0]["userId"])
     }
 
+    /**
+     * 1.4.0-beta.14 test (Android, React Native host): on a cold launch after
+     * the session expired, ON_START ran on the main thread while initialize()
+     * was still constructing the SDK on the bridge's background thread, and
+     * FlagsManager.onForeground -> refresh died with a NullPointerException
+     * on the app-version lazy, declared below init {} and so still null. The
+     * refresh was lost. The seam runs a refresh exactly there - at the end of
+     * init {}, where every property declared below it is unassigned.
+     */
+    @Test
+    fun `a flags refresh from a foreground that arrives before the constructor finishes is sent with its context`() {
+        Joryio.endOfInitForTesting = { sdk -> kotlinx.coroutines.runBlocking { sdk.refreshFlagsForTesting() } }
+        try {
+            init()
+        } finally {
+            Joryio.endOfInitForTesting = null
+        }
+        val evaluate = bodies("/v1/flags/evaluate")
+        assertEquals("the early refresh reached the server", 1, evaluate.size)
+        assertEquals("android", evaluate[0].getAsJsonObject("context")["platform"].asString)
+    }
+
     private fun refreshed(sdk: Joryio) {
         var done = false
         sdk.refreshFlags { done = true }

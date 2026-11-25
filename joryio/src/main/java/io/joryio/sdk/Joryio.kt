@@ -434,6 +434,39 @@ class Joryio private constructor(
      */
     private val heldLinkTokens = ArrayDeque<String>()
 
+    // ── Read from the foreground handler: declared ahead of init {} ───────
+    //
+    // init {} posts the lifecycle observer to the main thread when
+    // initialize() runs elsewhere (the React Native bridge calls it from a
+    // background thread). ON_START can then fire - and flags refresh, the
+    // attribute retry run - while this constructor is still going, and a
+    // property declared BELOW init {} is still null then: 1.4.0-beta.14 died
+    // with a NullPointerException on `flagsAppVersion`'s lazy delegate in
+    // FlagsManager.onForeground -> refresh on cold launches, and that refresh
+    // was lost (caught by the coroutine handler). Keep anything the ON_START
+    // path reads up here.
+
+    /** The app's version, read once (sent as `context.appVersion`). */
+    private val flagsAppVersion: String? by lazy {
+        try {
+            val pm = appContext.packageManager
+            val info = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                pm.getPackageInfo(appContext.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(appContext.packageName, 0)
+            }
+            info.versionName
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Failed pending-set flushes in a row; the retry backoff grows with it. */
+    @Volatile
+    private var attributeRetryFailures = 0
+    private var attributeRetryJob: kotlinx.coroutines.Job? = null
+
     private fun addToOutbox(kind: String, path: String, request: Any, key: String? = null, alsoReplaces: String? = null) {
         val body = try {
             io.joryio.sdk.network.WireJson.gson.toJson(request)
@@ -1177,6 +1210,9 @@ class Joryio private constructor(
 
             logger.info("Joryio SDK initialized successfully")
         }
+        // Test seam: runs where an early ON_START can (every property
+        // declared below init {} is still unassigned here).
+        endOfInitForTesting?.invoke(this)
     }
 
     private fun postToMain(action: () -> Unit) {
@@ -1879,11 +1915,6 @@ class Joryio private constructor(
             scheduleAttributeRetry()
         }
     }
-
-    /** Failed pending-set flushes in a row; the retry backoff grows with it. */
-    @Volatile
-    private var attributeRetryFailures = 0
-    private var attributeRetryJob: kotlinx.coroutines.Job? = null
 
     /**
      * Retry a failed pending-set flush on a backoff (scan 5, Android NICE 3;
@@ -2648,6 +2679,10 @@ class Joryio private constructor(
     @androidx.annotation.VisibleForTesting
     internal fun currentActivityForTesting(): android.app.Activity? = currentActivity?.get()
 
+    /** Test seam: a flags refresh now, on the caller's thread (the ON_START path's request). */
+    @androidx.annotation.VisibleForTesting
+    internal suspend fun refreshFlagsForTesting() = flagsManager.refreshFlags()
+
     /** True once the host app has claimed display via setInAppMessageCallback. */
     @Volatile
     private var hostHandlesDisplay = false
@@ -3003,22 +3038,6 @@ class Joryio private constructor(
         cardManager.onCardsUpdated(listener)
 
     // ── Feature flags (BACKLOG D446) ─────────────────────────────────────
-
-    /** The app's version, read once (sent as `context.appVersion`). */
-    private val flagsAppVersion: String? by lazy {
-        try {
-            val pm = appContext.packageManager
-            val info = if (android.os.Build.VERSION.SDK_INT >= 33) {
-                pm.getPackageInfo(appContext.packageName, android.content.pm.PackageManager.PackageInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(appContext.packageName, 0)
-            }
-            info.versionName
-        } catch (e: Exception) {
-            null
-        }
-    }
 
     /** Device context sent with every flags request; matched by attribute rules. */
     private fun flagsContext(): Map<String, Any?> = buildMap {
@@ -4564,9 +4583,15 @@ class Joryio private constructor(
             }
         }
 
+        /** Test seam: called at the very end of init {} - see the foreground-handler properties. */
+        @androidx.annotation.VisibleForTesting
+        @Volatile
+        internal var endOfInitForTesting: ((Joryio) -> Unit)? = null
+
         /** Test seam: forget the singleton and the buffer. */
         @androidx.annotation.VisibleForTesting
         internal fun resetForTesting() {
+            endOfInitForTesting = null
             SdkIdentity.resetForTest()
             val dropped = synchronized(pendingActions) { pendingActions.toList() }
             settleDropped(dropped)

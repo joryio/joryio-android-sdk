@@ -120,4 +120,40 @@ class StaleConnectionTest {
         val keys = sent.map { JsonParser.parseString(it.body).asJsonObject.get("idempotencyKey").asString }.toSet()
         assertEquals(setOf("7f1c2a8e-0b7e-4c41-9a3e-5d2f8c6b1a90"), keys)
     }
+
+    private val exposures = """{"anonymousId":"x","sessionId":"s","exposures":[{"key":"k","variant":"on"}],"idempotencyKey":"7f1c2a8e-0b7e-4c41-9a3e-5d2f8c6b1a90"}""" // gitleaks:allow
+
+    /**
+     * 1.4.0-beta.14 test: a 408 on /v1/flags/exposures was sent again by
+     * OkHttp ~12 ms later (its RetryAndFollowUpInterceptor re-sends a 408 with
+     * no Retry-After when retryOnConnectionFailure is on), skipping the first
+     * wait. Now the 408 comes back to the FlagsManager, which hands the batch
+     * to the outbox; the server's own (absent) Retry-After is what it reads.
+     */
+    @Test
+    fun aFlagExposures408IsNotReSentByOkHttp() = runBlocking {
+        api.answers["/v1/flags/exposures"] = { TestServer.json("""{"error":"timeout"}""", 408) }
+        val status = client.postFlagExposures(exposures)
+        assertEquals(408, status.status)
+        assertEquals("the server sent no Retry-After", null, status.retryAfterMs)
+        assertEquals("sent once", 1, count("/v1/flags/exposures"))
+    }
+
+    @Test
+    fun aFlagExposures408WithRetryAfterZeroIsNotReSentAndKeepsItsHeader() = runBlocking {
+        api.answers["/v1/flags/exposures"] = { TestServer.json("{}", 408).setHeader("Retry-After", "0") }
+        val status = client.postFlagExposures(exposures)
+        assertEquals(408, status.status)
+        assertEquals(0L, status.retryAfterMs)
+        assertEquals(1, count("/v1/flags/exposures"))
+    }
+
+    /** The 408 change leaves the beta.12 stale-connection recovery in place for exposures. */
+    @Test
+    fun flagExposuresThroughTheirOwnCallOnAStaleConnectionStillGetThrough() = runBlocking {
+        staleConnection()
+        val status = client.postFlagExposures(exposures)
+        assertEquals(200, status.status)
+        assertEquals(1, count("/v1/flags/exposures"))
+    }
 }

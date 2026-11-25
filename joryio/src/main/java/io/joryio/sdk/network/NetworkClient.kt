@@ -96,6 +96,9 @@ internal class NetworkClient(
             return (date.time - now).coerceIn(0L, MAX_RETRY_AFTER_MS)
         }
         private const val SDK_AUTH_HEADER = "X-Joryio-Auth"
+        private const val FLAG_EXPOSURES_PATH = "/v1/flags/exposures"
+        /** Internal to this client: never sent, removed before a caller sees the response. */
+        private const val ORIGINAL_RETRY_AFTER_HEADER = "X-Joryio-Original-Retry-After"
 
         /** See [requestUserId]. */
         internal fun subjectUserIdOf(json: String): String? = try {
@@ -221,6 +224,9 @@ internal class NetworkClient(
             .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            // Outermost: puts back a flag-exposures 408's own Retry-After
+            // (see createNo408ResendNetworkInterceptor).
+            .addInterceptor(createRestoreRetryAfterInterceptor())
             .addInterceptor(createAuthInterceptor())
             // Added AFTER the SDK-key interceptor so this (inner) interceptor's
             // received request already carries the base headers; its one-shot
@@ -231,6 +237,7 @@ internal class NetworkClient(
                     addInterceptor(createLoggingInterceptor())
                 }
             }
+            .addNetworkInterceptor(createNo408ResendNetworkInterceptor())
             .build()
 
         val retrofit = Retrofit.Builder()
@@ -241,6 +248,47 @@ internal class NetworkClient(
 
         api = retrofit.create(JoryioApi::class.java)
         logger.debug("NetworkClient initialized with base URL: $normalizedBaseUrl")
+    }
+
+    /**
+     * A 408 on POST /v1/flags/exposures goes back to the FlagsManager as it
+     * came, not re-sent by OkHttp (1.4.0-beta.15).
+     *
+     * With `retryOnConnectionFailure` on - kept on since 1.4.0-beta.12 for
+     * stale pooled connections - OkHttp's RetryAndFollowUpInterceptor sends a
+     * request again, at once, after a 408 that has no Retry-After (or
+     * `Retry-After: 0`). The beta.14 test saw an exposures batch re-sent 12 ms
+     * after its 408, skipping the first wait the FlagsManager / outbox apply
+     * (iOS and web wait: URLSession and fetch never re-send a 408). OkHttp
+     * leaves a 408 alone when it carries a positive Retry-After, so this
+     * NETWORK interceptor (inside the retry loop) gives an exposures 408 one,
+     * remembering what the server sent; [createRestoreRetryAfterInterceptor]
+     * puts that back before anyone reads it. Stale-connection recovery is
+     * untouched: it never sees a response.
+     */
+    private fun createNo408ResendNetworkInterceptor(): Interceptor = Interceptor { chain ->
+        val response = chain.proceed(chain.request())
+        if (response.code != 408 || !chain.request().url.encodedPath.endsWith(FLAG_EXPOSURES_PATH)) {
+            return@Interceptor response
+        }
+        val original = response.header("Retry-After")
+        // OkHttp's rule: no header, or a whole number of seconds that is zero, means "re-send now".
+        val reSentByOkHttp = original == null || original.matches(Regex("0+"))
+        if (!reSentByOkHttp) return@Interceptor response
+        response.newBuilder()
+            .header("Retry-After", "1")
+            .header(ORIGINAL_RETRY_AFTER_HEADER, original ?: "")
+            .build()
+    }
+
+    /** Undoes [createNo408ResendNetworkInterceptor]'s Retry-After: callers see the server's own header. */
+    private fun createRestoreRetryAfterInterceptor(): Interceptor = Interceptor { chain ->
+        val response = chain.proceed(chain.request())
+        val original = response.header(ORIGINAL_RETRY_AFTER_HEADER) ?: return@Interceptor response
+        response.newBuilder()
+            .removeHeader(ORIGINAL_RETRY_AFTER_HEADER)
+            .apply { if (original.isEmpty()) removeHeader("Retry-After") else header("Retry-After", original) }
+            .build()
     }
 
     /**

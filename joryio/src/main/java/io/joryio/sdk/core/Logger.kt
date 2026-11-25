@@ -16,7 +16,7 @@ internal class Logger(
         // hardcoding its own copy, which said 1.0.0 while this said 1.1.0. The
         // version-parity tripwire cannot catch that, because a log string is not
         // one of the sites it pins. One constant, no second copy to drift.
-        internal const val SDK_VERSION = "1.4.0-beta.14"
+        internal const val SDK_VERSION = "1.4.0-beta.15"
     }
 
     fun verbose(message: String) {
