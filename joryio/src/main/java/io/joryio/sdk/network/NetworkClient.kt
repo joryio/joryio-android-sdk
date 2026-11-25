@@ -50,17 +50,6 @@ internal class NetworkClient(
     private val okHttpClient: OkHttpClient
 
     /**
-     * The same client, but a request that lost its connection is NOT sent a
-     * second time by OkHttp ([OkHttpClient.Builder.retryOnConnectionFailure],
-     * on by default). For the calls documented "ONCE" - flags and placements:
-     * a POST whose connection dropped after the server read it was silently
-     * sent again, so every flag exposure in that request was counted twice
-     * (the 1.4.0-beta.10 test, Android only - iOS's URLSession does not
-     * re-send a POST, and neither does the browser).
-     */
-    private val onceApi: JoryioApi
-
-    /**
      * `Joryio-Android/<sdk> (<package>; Android <release>)` — an app-shaped
      * User-Agent, so we are never mistaken for a scripted HTTP client. Built
      * defensively: a Context that cannot report its package name must not stop
@@ -251,10 +240,6 @@ internal class NetworkClient(
             .build()
 
         api = retrofit.create(JoryioApi::class.java)
-        onceApi = retrofit.newBuilder()
-            .client(okHttpClient.newBuilder().retryOnConnectionFailure(false).build())
-            .build()
-            .create(JoryioApi::class.java)
         logger.debug("NetworkClient initialized with base URL: $normalizedBaseUrl")
     }
 
@@ -755,8 +740,17 @@ internal class NetworkClient(
     }
 
     /**
-     * Feature flags (flags/FlagsManager.kt): POST [path] ONCE - no retries,
-     * the held answer stays in use until the next refresh. The
+     * Feature flags (flags/FlagsManager.kt): POST [path] - no SDK retries,
+     * the held answer stays in use until the next refresh.
+     *
+     * OkHttp's own connection-failure recovery stays ON (1.4.0-beta.12): a
+     * request written to a pooled connection the server had already closed
+     * (keep-alive expiry, the ALB's idle timeout, a NAT or carrier drop)
+     * fails with "unexpected end of stream" before any answer, and only that
+     * recovery sends it again on a fresh connection. 1.4.0-beta.11 switched
+     * it off and the first flags / placements / cards call after an idle
+     * minute failed. An evaluate is a read; an exposures batch carries its
+     * `idempotencyKey`, so a re-sent copy is counted once by the server. The
      * SDK-authentication token follows the body's `userId`, like every other
      * request. Returns the body of a 2xx answer, else null.
      */
@@ -764,7 +758,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = onceApi.postFlags(path, body)
+            val response = api.postFlags(path, body)
             if (response.isSuccessful) response.body()?.string() else null
         } catch (e: Exception) {
             logger.debug("Flags request failed: ${e.message}")
@@ -799,7 +793,8 @@ internal class NetworkClient(
     }
 
     /**
-     * POST v1/in-app/placements ONCE - no retries: a placement answer is only
+     * POST v1/in-app/placements - no SDK retries (OkHttp's stale-connection
+     * recovery only, see [postFlags]): a placement answer is only
      * useful now, and a 429 (the per-device limit) means "keep your cache".
      * Returns the HTTP status (0 = no answer) and, on success, the body.
      */
@@ -807,7 +802,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext 0 to null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = onceApi.fetchPlacements(body)
+            val response = api.fetchPlacements(body)
             response.code() to (if (response.isSuccessful) response.body()?.string() else null)
         } catch (e: Exception) {
             logger.debug("Placements request failed: ${e.message}")
@@ -816,7 +811,7 @@ internal class NetworkClient(
     }
 
     /**
-     * POST v1/in-app/cards ONCE - no retries, like placements: a 429 (the
+     * POST v1/in-app/cards - no SDK retries, like placements: a 429 (the
      * per-device limit) or a failure means "keep your cached feed".
      * Returns the HTTP status (0 = no answer) and, on success, the body.
      */
@@ -824,7 +819,7 @@ internal class NetworkClient(
         if (!isNetworkAvailable()) return@withContext 0 to null
         try {
             val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
-            val response = onceApi.fetchCards(body)
+            val response = api.fetchCards(body)
             response.code() to (if (response.isSuccessful) response.body()?.string() else null)
         } catch (e: Exception) {
             logger.debug("Card feed request failed: ${e.message}")

@@ -155,6 +155,30 @@ class CardManagerTest {
         assertEquals("server", f.stateScope)
     }
 
+    /** 1.4.0-beta.11 test: a failed feed request blocked the next one for the whole 30 s window. */
+    @Test
+    fun aFailedRequestDoesNotBlockARefetchForTheWholeWindow() = runBlocking {
+        assertEquals(3, CARD_RETRY_AFTER_FAILURE_SECONDS)
+        var status = 0
+        val t = FakeTransport { if (status == 200) feed(listOf(card("a")), unread = 1) else status to null }
+        val m = manager(t)
+        assertTrue(m.getCards().cards.isEmpty())
+        status = 200
+        clock += 1_000
+        m.getCards()
+        assertEquals("inside the short backoff: not asked again", 1, t.fetches.size)
+        clock += CARD_RETRY_AFTER_FAILURE_SECONDS * 1000L
+        assertEquals(listOf("a"), m.getCards().cards.map { it.id })
+        assertEquals(2, t.fetches.size)
+        // A 429 keeps the whole window.
+        status = 429
+        clock += 301_000
+        m.getCards()
+        clock += CARD_RETRY_AFTER_FAILURE_SECONDS * 1000L + 1
+        m.getCards()
+        assertEquals(3, t.fetches.size)
+    }
+
     @Test
     fun servesTheCacheForTheTtlAndCoalescesRefreshes() = runBlocking {
         val t = FakeTransport { feed(listOf(card("a")), unread = 1) }

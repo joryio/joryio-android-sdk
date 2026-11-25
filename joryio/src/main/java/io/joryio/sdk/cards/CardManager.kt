@@ -40,7 +40,8 @@ internal interface CardStore {
  * - the last feed is served from the cache (memory + disk, scoped to the
  *   person) for its `ttlSeconds` ([CARD_FEED_TTL_SECONDS]);
  * - at most one network refresh per [CARD_MIN_REFRESH_SECONDS]: a forced
- *   refresh inside that window is deferred to its end and coalesced;
+ *   refresh inside that window is deferred to its end and coalesced; after a
+ *   request that got no answer (or a 5xx) only [CARD_RETRY_AFTER_FAILURE_SECONDS];
  * - `notModified: true`, `success: false`, HTTP 429 or no answer keep the cache;
  * - an identity or consent change bumps a generation: an answer to a request
  *   made before it is discarded; identity changes also clear the anonymous
@@ -290,7 +291,8 @@ internal class CardManager(
         // empty feed, so nothing is asked (and nobody named).
         if (consentNow != "granted") return null
         val generationAtStart = generation
-        if (cursor == null) synchronized(lock) { lastNetworkAt = now() }
+        val sentAt = now()
+        if (cursor == null) synchronized(lock) { lastNetworkAt = sentAt }
         val body = requestBody(cursor, consentNow)
         val (status, text) = try {
             transport.fetch(gson.toJson(body))
@@ -299,6 +301,13 @@ internal class CardManager(
         }
         if (status !in 200..299 || text == null) {
             log("Card feed request answered $status; keeping the cached feed")
+            // No answer (status 0) or a server error: the next refresh may go after
+            // CARD_RETRY_AFTER_FAILURE_SECONDS, not the whole window (1.4.0-beta.12).
+            if (cursor == null && (status == 0 || status >= 500)) synchronized(lock) {
+                if (lastNetworkAt == sentAt) {
+                    lastNetworkAt = sentAt - (CARD_MIN_REFRESH_SECONDS - CARD_RETRY_AFTER_FAILURE_SECONDS) * 1000L
+                }
+            }
             return null
         }
         if (generation != generationAtStart) {

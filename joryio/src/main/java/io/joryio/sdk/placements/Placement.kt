@@ -15,6 +15,14 @@ const val PLACEMENT_VIEWABLE_FRACTION: Double = 0.5
 /** A placement key is fetched from the network at most once per this many seconds. */
 const val PLACEMENT_MIN_REFRESH_SECONDS: Int = 30
 
+/**
+ * A request that got no answer (no connection, a 5xx) holds its keys back
+ * this many seconds instead of [PLACEMENT_MIN_REFRESH_SECONDS]: one failed
+ * request must not leave a placement empty for 30 s. A 429 keeps the full
+ * window (the server asked us to wait).
+ */
+const val PLACEMENT_RETRY_AFTER_FAILURE_SECONDS: Int = 3
+
 /** Keys asked for within this window go in one request. */
 const val PLACEMENT_BATCH_WINDOW_MS: Long = 50L
 

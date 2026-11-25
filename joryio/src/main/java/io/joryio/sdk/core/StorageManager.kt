@@ -333,6 +333,7 @@ internal class StorageManager(
         private const val KEY_PUSH_UNREGISTERED = "push_unregistered"
         private const val KEY_PENDING_UNREGISTER = "pending_unregister"
         private const val KEY_FLAGS_CACHE = "flags_cache"
+        private const val KEY_FLAG_EXPOSURES = "jry_flag_exposures"
         private const val KEY_RETIRED_AUTH_TOKENS = "retired_sdk_auth_tokens"
         private const val KEY_HELD_USER_ID = "held_user_id"
         private const val KEY_SIGNED_IN_ANONYMOUS_IDS = "signed_in_anonymous_ids"
@@ -596,6 +597,14 @@ internal class StorageManager(
     fun setFlagsCache(json: String?) {
         if (json.isNullOrEmpty()) prefs.edit().remove(KEY_FLAGS_CACHE).apply()
         else prefs.edit().putString(KEY_FLAGS_CACHE, json).apply()
+    }
+
+    /** The current session's flag exposure marks (flags/FlagsManager.kt, BACKLOG D479); clearAllData() removes them. */
+    fun getFlagExposures(): String? = prefs.getString(KEY_FLAG_EXPOSURES, null)
+
+    fun setFlagExposures(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_FLAG_EXPOSURES).apply()
+        else prefs.edit().putString(KEY_FLAG_EXPOSURES, json).apply()
     }
 
     fun getPendingUnregister(): String? = prefs.getString(KEY_PENDING_UNREGISTER, null)

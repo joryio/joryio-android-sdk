@@ -150,6 +150,53 @@ class PlacementManagerTest {
         assertEquals(listOf("camp-1"), r["home_hero"]!!.items.map { it.id })
     }
 
+    /**
+     * 1.4.0-beta.11 test: a placements request that failed on a stale
+     * connection stamped its keys for the whole 30 s window, so they read
+     * empty for 30 s. A request with no answer (or a 5xx) holds them back only
+     * PLACEMENT_RETRY_AFTER_FAILURE_SECONDS; a 429 keeps the window.
+     */
+    @Test
+    fun aFailedRequestDoesNotBlockARefetchForTheWholeWindow() = runBlocking {
+        assertEquals(3, PLACEMENT_RETRY_AFTER_FAILURE_SECONDS)
+        var status = 0
+        val t = FakeTransport { if (status == 200) answer(hero()) else status to null }
+        val m = manager(t)
+        assertTrue(m.getPlacements(listOf("home_hero"))["home_hero"]!!.items.isEmpty())
+        status = 200
+        clock += 1_000
+        m.getPlacements(listOf("home_hero"))
+        assertEquals("inside the short backoff: not asked again", 1, t.fetches.size)
+        clock += PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000L
+        val r = m.getPlacements(listOf("home_hero"))
+        assertEquals(2, t.fetches.size)
+        assertEquals(listOf("camp-1"), r["home_hero"]!!.items.map { it.id })
+        // A 5xx is a failure too.
+        clock += PLACEMENT_MIN_REFRESH_SECONDS * 1000L
+        status = 503
+        m.refreshPlacements(listOf("home_hero"))
+        waitUntil { t.fetches.size == 3 }
+        Thread.sleep(100)
+        clock += PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000L
+        status = 200
+        m.refreshPlacements(listOf("home_hero"))
+        waitUntil { t.fetches.size == 4 }
+        assertEquals(4, t.fetches.size)
+    }
+
+    @Test
+    fun a429KeepsTheWholeRefreshWindow() = runBlocking {
+        val t = FakeTransport { 429 to null }
+        val m = manager(t)
+        m.getPlacements(listOf("home_hero"))
+        clock += PLACEMENT_RETRY_AFTER_FAILURE_SECONDS * 1000L + 1
+        m.getPlacements(listOf("home_hero"))
+        assertEquals(1, t.fetches.size)
+        clock += PLACEMENT_MIN_REFRESH_SECONDS * 1000L
+        m.getPlacements(listOf("home_hero"))
+        assertEquals(2, t.fetches.size)
+    }
+
     @Test
     fun withoutConsentTheRequestNamesNobodyAndNothingIsReported() = runBlocking {
         consentValue = "denied"

@@ -39,6 +39,7 @@ class FlagsManagerTest {
         @Volatile var anonymousId = "anon-1"
         @Volatile var sessionId = "s-1"
         @Volatile var stored: String? = null
+        @Volatile var exposures: String? = null
         @Volatile var now = 1_000_000L
     }
 
@@ -55,6 +56,8 @@ class FlagsManagerTest {
         context = { mapOf("platform" to "android") },
         load = { state.stored },
         save = { state.stored = it },
+        loadExposures = { state.exposures },
+        saveExposures = { state.exposures = it },
         postMain = { it.run() },
         now = { state.now },
         exposureFlushMs = 50,
@@ -144,6 +147,11 @@ class FlagsManagerTest {
         state.sessionId = "s-2"
         m.getBoolFlag("new_checkout", false)
         assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 2 })
+        // 1.4.0-beta.12: every batch carries its own idempotencyKey (a UUID), the
+        // same in every copy of that request, so a re-sent batch is recorded once.
+        val keys = server.calls("v1/flags/exposures").map { it["idempotencyKey"].asString }
+        keys.forEach { assertTrue(it, Regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").matches(it)) }
+        assertEquals("one key per batch", 2, keys.toSet().size)
     }
 
     @Test
@@ -254,6 +262,84 @@ class FlagsManagerTest {
         m.wipe()
         assertNull(state.stored)
         assertEquals("x", m.getStringFlag("headline", "x"))
+    }
+
+    // ── BACKLOG D479: the marks survive a relaunch inside the session ──
+
+    /** A relaunch: a new manager over the same stores, the session resumed. */
+    private fun relaunch(server: Server, state: State): FlagsManager {
+        val m = manager(server, state)
+        runBlocking { m.refreshFlags() }
+        return m
+    }
+
+    @Test
+    fun `a relaunch in the same session sends no exposure again`() {
+        val (m, server, state) = ready()
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 1 })
+        val stored = JsonParser.parseString(state.exposures).asJsonObject
+        assertEquals("s-1", stored["sessionId"].asString)
+        assertEquals(listOf("s-1||anon-1|new_checkout|on"), stored["marks"].asJsonArray.map { it.asString })
+
+        val again = relaunch(server, state)
+        again.getBoolFlag("new_checkout", false)
+        Thread.sleep(300)
+        assertEquals("no duplicate after the relaunch", 1, server.calls("v1/flags/exposures").size)
+        // A flag not read before the relaunch is still reported.
+        again.getStringFlag("headline", "")
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 2 })
+        assertEquals(listOf("headline"), server.calls("v1/flags/exposures")[1]["exposures"].asJsonArray.map { it.asJsonObject["key"].asString })
+    }
+
+    @Test
+    fun `a new session sends again and keeps only its own marks`() {
+        val (m, server, state) = ready()
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 1 })
+        state.sessionId = "s-2" // the session expired before the relaunch
+        val again = relaunch(server, state)
+        again.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 2 })
+        val stored = JsonParser.parseString(state.exposures).asJsonObject
+        assertEquals("s-2", stored["sessionId"].asString)
+        assertEquals(listOf("s-2||anon-1|new_checkout|on"), stored["marks"].asJsonArray.map { it.asString })
+    }
+
+    @Test
+    fun `reset and identify of another user clear the marks`() {
+        val (m, server, state) = ready()
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 1 })
+        assertNotNull(state.exposures)
+        m.clearExposureMarks() // what reset() and identify() of another user call
+        assertNull(state.exposures)
+        m.getBoolFlag("new_checkout", false)
+        assertTrue("cleared in memory too", waitUntil { server.calls("v1/flags/exposures").size == 2 })
+        assertTrue(waitUntil { state.exposures != null })
+        m.clearExposureMarks()
+        relaunch(server, state).getBoolFlag("new_checkout", false)
+        assertTrue("cleared on disk", waitUntil { server.calls("v1/flags/exposures").size == 3 })
+        m.wipe()
+        assertNull(state.exposures)
+    }
+
+    @Test
+    fun `at most FLAG_EXPOSURE_MARKS_MAX marks are kept, the oldest go first`() {
+        assertEquals(500, FLAG_EXPOSURE_MARKS_MAX)
+        val many = (0..FLAG_EXPOSURE_MARKS_MAX).joinToString(",") { i ->
+            """
+            "f$i":{"value":true,"variant":"on","valueType":"boolean","reason":"rule","version":1,"logExposure":true}
+            """.trim()
+        }
+        val server = Server().apply { answer = """{"etag":"m","ttlSeconds":300,"flags":{$many}}""" }
+        val (m, _, state) = ready(server)
+        for (i in 0..FLAG_EXPOSURE_MARKS_MAX) m.getBoolFlag("f$i", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").isNotEmpty() && state.exposures != null })
+        val marks = JsonParser.parseString(state.exposures).asJsonObject["marks"].asJsonArray.map { it.asString }
+        assertEquals(FLAG_EXPOSURE_MARKS_MAX, marks.size)
+        assertFalse("the oldest went first", marks.contains("s-1||anon-1|f0|on"))
+        assertTrue(marks.contains("s-1||anon-1|f$FLAG_EXPOSURE_MARKS_MAX|on"))
     }
 
     @Test

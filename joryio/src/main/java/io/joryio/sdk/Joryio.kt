@@ -923,6 +923,8 @@ class Joryio private constructor(
             context = { flagsContext() },
             load = { storage.getFlagsCache() },
             save = { storage.setFlagsCache(it) },
+            loadExposures = { storage.getFlagExposures() },
+            saveExposures = { storage.setFlagExposures(it) },
             postMain = { r -> Handler(Looper.getMainLooper()).post(r) },
             log = { logger.debug(it) },
         )
@@ -1410,9 +1412,11 @@ class Joryio private constructor(
 
         // Under the identity lock: an identify right after reset() must merge
         // with the NEW anonymous id, never the one reset() replaced.
+        var switchedUser = false
         val (request, changed) = synchronized(identityLock) {
             val before = identityManager.getUserId()
             if (before != null && before != userId) {
+                switchedUser = true
                 // Another user WITHOUT reset() (contract item 53): treated as
                 // reset-then-identify for what belongs to the outgoing user.
                 // Their attribute writes not yet sent go out under THEIR ids
@@ -1436,6 +1440,8 @@ class Joryio private constructor(
                 attributes = emptyMap()
             ) to (before != userId)
         }
+        // Another user: the previous user's exposure marks go too (BACKLOG D479).
+        if (switchedUser) flagsManager.clearExposureMarks()
         sessionManager.updateActivity()
         enqueueWrite("identify", "v1/identify", request)
         // A sync in flight was asked for the previous identity: its answer is
@@ -1593,6 +1599,8 @@ class Joryio private constructor(
             dropHeldForHandler()
             // The previous person's flags; their unsent exposures go as them.
             flagsManager.onIdentityChanged()
+            // ...and their exposure marks (BACKLOG D479).
+            flagsManager.clearExposureMarks()
 
             // Re-associate the device token with the fresh anonymous
             // identity so a new user does not inherit the previous user's

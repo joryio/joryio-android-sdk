@@ -18,6 +18,13 @@ const val FLAGS_MIN_REFRESH_SECONDS = 60L
 /** Exposures are sent in one request this long after the first read. */
 const val FLAG_EXPOSURE_FLUSH_MS = 1000L
 
+/**
+ * Exposure marks kept for the current session (BACKLOG D479); past this the
+ * oldest goes first. A session reads far fewer flags, so this only bounds the
+ * stored list.
+ */
+const val FLAG_EXPOSURE_MARKS_MAX = 500
+
 /** The silent-push `jry_sync` value that refreshes flags now. */
 const val FLAG_SYNC_PUSH_VALUE = "flags"
 
@@ -43,7 +50,15 @@ internal const val FLAG_EXPOSURES_PER_CALL_MAX = 100
  *   a session: once per person, flag and variant per session, unless the
  *   answer said `logExposure: false`. getAllFlags() logs none. Each batch
  *   carries the identity it was read under: never sent as the next person,
- *   dropped when consent is withdrawn before it goes.
+ *   dropped when consent is withdrawn before it goes. Each batch carries an
+ *   `idempotencyKey` (a UUID): a copy re-sent after a dropped connection is
+ *   recorded once by the server.
+ * - The "already sent" marks are kept on disk for the current session only
+ *   (`jry_flag_exposures`, at most [FLAG_EXPOSURE_MARKS_MAX]), so a relaunch
+ *   that resumes the session sends no exposure again (BACKLOG D479). A new
+ *   session drops them; reset(), identify() of another user and wipeData()
+ *   clear them. The server counts one exposure per person, flag, variant and
+ *   session anyway - this only saves the request.
  * - Without tracking consent nothing is sent and the getters return the
  *   in-code default.
  */
@@ -60,6 +75,10 @@ internal class FlagsManager(
     private val context: () -> Map<String, Any?>,
     private val load: () -> String?,
     private val save: (String?) -> Unit,
+    /** The stored exposure marks of the current session (JSON), or null. */
+    private val loadExposures: () -> String? = { null },
+    /** Store the exposure marks (JSON); null removes them. */
+    private val saveExposures: (String?) -> Unit = {},
     /** Where onFlagsUpdated listeners run (the main thread in the SDK). */
     private val postMain: (Runnable) -> Unit,
     private val log: (String) -> Unit = {},
@@ -68,6 +87,14 @@ internal class FlagsManager(
 ) {
     private class PendingBatch(val body: JsonObject, val generation: Int) {
         val exposures = mutableListOf<Pair<String, String>>()
+
+        /**
+         * The batch's `idempotencyKey` (1.4.0-beta.12): one per batch, fixed
+         * before the body is built, so every copy of this request - OkHttp
+         * re-sending it after a dropped connection - carries the same key and
+         * the server records the batch once.
+         */
+        val idempotencyKey: String = java.util.UUID.randomUUID().toString()
     }
 
     private val lock = Any()
@@ -83,8 +110,11 @@ internal class FlagsManager(
     private var inflightGeneration = 0
     private val listeners = LinkedHashMap<Any, (List<String>) -> Unit>()
 
-    /** `<session>|<person>|<flag>|<variant>` already reported. */
-    private val exposed = HashSet<String>()
+    /** `<session>|<person>|<flag>|<variant>` already reported, oldest first; persisted for [exposedSession]. */
+    private val exposed = LinkedHashSet<String>()
+
+    /** The session [exposed] belongs to; null = not read from storage yet. */
+    private var exposedSession: String? = null
     private var pending: PendingBatch? = null
     private var flushScheduled = false
 
@@ -133,8 +163,10 @@ internal class FlagsManager(
             fetchedAt = 0L
             used = false
             exposed.clear()
+            exposedSession = null
         }
         save(null)
+        try { saveExposures(null) } catch (e: Exception) { /* storage unavailable */ }
     }
 
     // ── Reading ──────────────────────────────────────────────────────────
@@ -221,12 +253,15 @@ internal class FlagsManager(
         val logExposure = (f.get("logExposure") as? JsonPrimitive)?.takeIf { it.isBoolean }?.asBoolean ?: true
         if (!logExposure) return
         val variant = f.str("variant") ?: ""
-        val mark = "${sessionId()}|${subjectKey()}|$key|$variant"
+        val session = sessionId()
+        val mark = "$session|${subjectKey()}|$key|$variant"
         val body = requestBody()
         var previous: PendingBatch? = null
         var schedule = false
         synchronized(lock) {
+            useExposureSessionLocked(session)
             if (!exposed.add(mark)) return
+            while (exposed.size > FLAG_EXPOSURE_MARKS_MAX) exposed.remove(exposed.first())
             val current = pending
             if (current == null || current.generation != generation) {
                 // A batch from before an identity change goes first, as its own person.
@@ -269,7 +304,11 @@ internal class FlagsManager(
             })
         }
         body.add("exposures", list)
+        body.addProperty("idempotencyKey", batch.idempotencyKey)
         val json = body.toString()
+        // Stored when the batch goes, not when it is queued: an app killed in
+        // the second before the flush has not reported it, so a relaunch must.
+        persistExposureMarks()
         scope.launch {
             try {
                 post("v1/flags/exposures", json)
@@ -408,6 +447,62 @@ internal class FlagsManager(
             save(s.toString())
         } catch (e: Exception) {
             // Storage unavailable: memory only.
+        }
+    }
+
+    /**
+     * Point [exposed] at [session]: the first time, seeded from storage when
+     * the stored marks are this session's (a relaunch that resumed it); on a
+     * new session, the previous session's marks are dropped.
+     */
+    private fun useExposureSessionLocked(session: String) {
+        if (exposedSession == session) return
+        val first = exposedSession == null
+        exposed.clear()
+        exposedSession = session
+        if (!first) return
+        try {
+            val raw = loadExposures() ?: return
+            val s = JsonParser.parseString(raw).asJsonObject
+            if (s.str("sessionId") != session) return
+            (s.get("marks") as? JsonArray)?.forEach { m ->
+                if (m is JsonPrimitive && m.isString) exposed.add(m.asString)
+            }
+            while (exposed.size > FLAG_EXPOSURE_MARKS_MAX) exposed.remove(exposed.first())
+        } catch (e: Exception) {
+            // Unreadable: start empty.
+        }
+    }
+
+    /** Store the current session's marks (JSON `{"sessionId", "marks"}`). */
+    private fun persistExposureMarks() {
+        val stored = synchronized(lock) {
+            val session = exposedSession ?: return
+            JsonObject().apply {
+                addProperty("sessionId", session)
+                add("marks", JsonArray().also { a -> exposed.forEach { a.add(it) } })
+            }.toString()
+        }
+        try {
+            saveExposures(stored)
+        } catch (e: Exception) {
+            // Storage unavailable: memory only.
+        }
+    }
+
+    /**
+     * reset() or identify() of another user: the exposure marks go, in
+     * memory and on disk (the attribute-clearing rule of 1.4.0-beta.11).
+     */
+    fun clearExposureMarks() {
+        synchronized(lock) {
+            exposed.clear()
+            exposedSession = null
+        }
+        try {
+            saveExposures(null)
+        } catch (e: Exception) {
+            // Storage unavailable.
         }
     }
 

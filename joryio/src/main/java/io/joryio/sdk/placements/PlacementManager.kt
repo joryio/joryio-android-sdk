@@ -92,7 +92,8 @@ internal interface PlacementCacheStore {
  *   scoped to the person);
  * - a key goes to the network at most once per PLACEMENT_MIN_REFRESH_SECONDS;
  *   a forced refresh inside that window is deferred and coalesced; a 429 or a
- *   failure keeps the cache;
+ *   failure keeps the cache; a request that got no answer (or a 5xx) holds
+ *   its keys back only PLACEMENT_RETRY_AFTER_FAILURE_SECONDS;
  * - an identity or consent change bumps a generation: answers to requests made
  *   before it are discarded;
  * - without consent the request names nobody and nothing is reported;
@@ -525,9 +526,11 @@ internal class PlacementManager(
         val body = JsonObject()
         val shown = JsonObject()
         val seq: Int
+        val sentAt: Long
         synchronized(lock) {
             seq = ++requestSeq
             val t = now()
+            sentAt = t
             keys.forEach { lastNetworkAt[it] = t }
             for (host in hosts) {
                 if (host.placementKey in keys) {
@@ -558,6 +561,15 @@ internal class PlacementManager(
         }
         if (status !in 200..299 || text == null) {
             log("Placements request answered $status; keeping the cached placements")
+            // No answer (status 0) or a server error: the keys may go again after
+            // PLACEMENT_RETRY_AFTER_FAILURE_SECONDS, not the whole refresh window
+            // (1.4.0-beta.12). A 429 or another 4xx keeps the window.
+            if (status == 0 || status >= 500) {
+                synchronized(lock) {
+                    val retryAt = sentAt - (PLACEMENT_MIN_REFRESH_SECONDS - PLACEMENT_RETRY_AFTER_FAILURE_SECONDS) * 1000L
+                    keys.forEach { if (lastNetworkAt[it] == sentAt) lastNetworkAt[it] = retryAt }
+                }
+            }
             return
         }
         if (generation != generationAtStart) {
