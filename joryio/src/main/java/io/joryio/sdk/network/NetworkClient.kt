@@ -766,6 +766,26 @@ internal class NetworkClient(
         }
     }
 
+    /**
+     * POST an exposures batch ([postFlags]' transport): the HTTP status
+     * (0 = no answer) and the server's Retry-After, so the FlagsManager can
+     * tell a batch the server took (or refused for good) from one to send
+     * again with the same `idempotencyKey`.
+     */
+    suspend fun postFlagExposures(json: String): io.joryio.sdk.flags.FlagsPostStatus = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext io.joryio.sdk.flags.FlagsPostStatus(0)
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.postFlags("v1/flags/exposures", body)
+            response.body()?.close()
+            response.errorBody()?.close()
+            io.joryio.sdk.flags.FlagsPostStatus(response.code(), parseRetryAfterMs(response.headers()["Retry-After"]))
+        } catch (e: Exception) {
+            logger.debug("Flag exposures request failed: ${e.message}")
+            io.joryio.sdk.flags.FlagsPostStatus(0)
+        }
+    }
+
     // MARK: - Subscriptions (marketing, not tracking consent)
 
     suspend fun updateChannelSubscription(

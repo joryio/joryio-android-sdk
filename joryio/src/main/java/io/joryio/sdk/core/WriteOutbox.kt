@@ -261,6 +261,7 @@ internal class WriteOutbox(
      * @param onProfileMissing runs before a 404'd write is retried - the
      *   caller flushes the event queue, which is what creates the profile.
      * @param onDone an entry the server acknowledged.
+     * @param onDropped an entry given up on (refused, or out of attempts).
      * @return the delay after which a retry should run, or null when there is
      *   nothing left to retry (drained, or sending is not allowed - consent
      *   pending / opted out, which have their own release triggers).
@@ -270,6 +271,7 @@ internal class WriteOutbox(
         canSend: (OutboxEntry) -> Boolean,
         onProfileMissing: suspend () -> Unit = {},
         onDone: (OutboxEntry) -> Unit = {},
+        onDropped: (OutboxEntry) -> Unit = {},
         send: suspend (OutboxEntry) -> OutboxResult,
     ): Long? {
         val now = clock()
@@ -282,7 +284,7 @@ internal class WriteOutbox(
             }
             val wait = try {
                 drainAgain = false
-                drainLocked(canSend, onProfileMissing, onDone, send)
+                drainLocked(canSend, onProfileMissing, onDone, onDropped, send)
             } finally {
                 drainMutex.unlock()
             }
@@ -294,6 +296,7 @@ internal class WriteOutbox(
         canSend: (OutboxEntry) -> Boolean,
         onProfileMissing: suspend () -> Unit,
         onDone: (OutboxEntry) -> Unit,
+        onDropped: (OutboxEntry) -> Unit,
         send: suspend (OutboxEntry) -> OutboxResult,
     ): Long? {
         // Set by a 402 on a non-withdrawal (contract item 50; scan 5, Android
@@ -322,6 +325,11 @@ internal class WriteOutbox(
                 is OutboxResult.Drop -> {
                     remove(entry)
                     logger.error("Server refused a ${entry.kind} write (${outcome.reason}); dropped")
+                    try {
+                        onDropped(entry)
+                    } catch (e: Exception) {
+                        logger.warn("Outbox drop hook failed: ${e.message}")
+                    }
                 }
                 is OutboxResult.Retry -> {
                     if (outcome.suspended && !isWithdrawal(entry)) {
@@ -350,6 +358,11 @@ internal class WriteOutbox(
                             logger.error(
                                 "${entry.kind} write still refused after $attempts attempts (${outcome.reason}); dropped",
                             )
+                            try {
+                                onDropped(entry)
+                            } catch (e: Exception) {
+                                logger.warn("Outbox drop hook failed: ${e.message}")
+                            }
                             continue
                         }
                         replace(entry.copy(attempts = attempts))

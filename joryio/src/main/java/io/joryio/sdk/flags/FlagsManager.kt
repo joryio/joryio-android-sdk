@@ -31,6 +31,39 @@ const val FLAG_SYNC_PUSH_VALUE = "flags"
 /** Exposures per request (the server's limit). */
 internal const val FLAG_EXPOSURES_PER_CALL_MAX = 100
 
+/** One exposures request's answer: the HTTP status (0 = no answer) and the server's Retry-After. */
+internal data class FlagsPostStatus(val status: Int, val retryAfterMs: Long? = null)
+
+/**
+ * Whether an exposures batch is finished with after an answer of [status]
+ * (0 = no answer): a 2xx, or a 4xx other than 408 / 429 - a refusal a retry
+ * would not change, as the write outbox drops one. A network failure, a 5xx,
+ * a 408 or a 429 keeps the batch for a retry. The same rule, under the same
+ * name, on iOS and the web.
+ */
+internal fun exposureBatchSettled(status: Int): Boolean = when (status) {
+    in 200..299 -> true
+    408, 429 -> false
+    in 400..499 -> true
+    else -> false
+}
+
+/**
+ * The marks of an exposures request body: `<session>|<user>|<anonymous>|<flag>|<variant>`,
+ * from the identity the batch carries. The same on iOS and the web.
+ */
+internal fun exposureMarks(json: String): List<String> = try {
+    val body = JsonParser.parseString(json).asJsonObject
+    fun s(k: String) = (body.get(k) as? JsonPrimitive)?.takeIf { it.isString }?.asString ?: ""
+    (body.get("exposures") as? JsonArray)?.mapNotNull { e ->
+        val o = e as? JsonObject ?: return@mapNotNull null
+        val key = (o.get("key") as? JsonPrimitive)?.asString ?: return@mapNotNull null
+        "${s("sessionId")}|${s("userId")}|${s("anonymousId")}|$key|${(o.get("variant") as? JsonPrimitive)?.asString ?: ""}"
+    } ?: emptyList()
+} catch (e: Exception) {
+    emptyList()
+}
+
 /**
  * Feature flags + remote config (Joryio BACKLOG D446). The Android twin of the
  * web SDK's `core/flags.ts` - the same names, the same wire values.
@@ -59,6 +92,15 @@ internal const val FLAG_EXPOSURES_PER_CALL_MAX = 100
  *   session drops them; reset(), identify() of another user and wipeData()
  *   clear them. The server counts one exposure per person, flag, variant and
  *   session anyway - this only saves the request.
+ * - A mark is stored only once the server took its batch
+ *   ([exposureBatchSettled]: a 2xx, or a 4xx other than 408 / 429). A batch
+ *   that got no answer, a 5xx, a 408 or a 429 is handed, with the SAME body
+ *   and `idempotencyKey`, to the SDK's persisted write outbox (kind
+ *   `flag_exposures`), which retries it on its backoff, across relaunches,
+ *   and discards it on wipeData(), an opt-out or a denied consent; its marks
+ *   are stored when the outbox settles it. While it waits there it counts as
+ *   already exposed (its marks are read from the outbox), so a read does not
+ *   queue it twice.
  * - Without tracking consent nothing is sent and the getters return the
  *   in-code default.
  */
@@ -66,6 +108,14 @@ internal class FlagsManager(
     private val scope: CoroutineScope,
     /** POST a JSON body; the response body, or null when there is no usable answer. */
     private val post: suspend (path: String, json: String) -> String?,
+    /** POST an exposures batch; the HTTP status (0 = no answer) and Retry-After. */
+    private val postExposures: suspend (json: String) -> FlagsPostStatus = { json ->
+        FlagsPostStatus(if (post("v1/flags/exposures", json) != null) 200 else 0)
+    },
+    /** Hand a batch the server did not take to the persisted write outbox (same body, same key). */
+    private val enqueueExposures: (json: String) -> Unit = {},
+    /** The bodies of the exposure batches waiting in the write outbox. */
+    private val pendingExposures: () -> List<String> = { emptyList() },
     /** true when the SDK may send (initialized, consent granted, not opted out). */
     private val canSend: () -> Boolean,
     private val userId: () -> String?,
@@ -85,16 +135,43 @@ internal class FlagsManager(
     private val now: () -> Long = System::currentTimeMillis,
     private val exposureFlushMs: Long = FLAG_EXPOSURE_FLUSH_MS,
 ) {
-    private class PendingBatch(val body: JsonObject, val generation: Int) {
+    private class PendingBatch(
+        val body: JsonObject,
+        val generation: Int,
+        /** `wipes` when the batch was made: one read before wipeData() is never handed to the outbox. */
+        val wipe: Int,
+        /**
+         * The batch's `idempotencyKey` (1.4.0-beta.12): one per request, fixed
+         * before the body is built, so every copy of this request - OkHttp
+         * re-sending it after a dropped connection, or our own retry - carries
+         * the same key and the server records it once.
+         */
+        val idempotencyKey: String = java.util.UUID.randomUUID().toString(),
+    ) {
         val exposures = mutableListOf<Pair<String, String>>()
 
-        /**
-         * The batch's `idempotencyKey` (1.4.0-beta.12): one per batch, fixed
-         * before the body is built, so every copy of this request - OkHttp
-         * re-sending it after a dropped connection - carries the same key and
-         * the server records the batch once.
-         */
-        val idempotencyKey: String = java.util.UUID.randomUUID().toString()
+        /** The batch's exposure marks, stored once the server took it. */
+        val marks = mutableListOf<String>()
+    }
+
+    /**
+     * [batch] as requests of at most [FLAG_EXPOSURES_PER_CALL_MAX] exposures,
+     * each with its own idempotencyKey (the first keeps the batch's) and its
+     * own marks: each is settled, kept and retried on its own. The same on iOS
+     * and the web.
+     */
+    private fun splitExposureBatch(batch: PendingBatch): List<PendingBatch> {
+        if (batch.exposures.size <= FLAG_EXPOSURES_PER_CALL_MAX) return listOf(batch)
+        return batch.exposures.indices.step(FLAG_EXPOSURES_PER_CALL_MAX).map { i ->
+            val end = minOf(i + FLAG_EXPOSURES_PER_CALL_MAX, batch.exposures.size)
+            PendingBatch(
+                batch.body, batch.generation, batch.wipe,
+                if (i == 0) batch.idempotencyKey else java.util.UUID.randomUUID().toString(),
+            ).apply {
+                exposures.addAll(batch.exposures.subList(i, end))
+                marks.addAll(batch.marks.subList(i, end))
+            }
+        }
     }
 
     private val lock = Any()
@@ -117,6 +194,12 @@ internal class FlagsManager(
     private var exposedSession: String? = null
     private var pending: PendingBatch? = null
     private var flushScheduled = false
+
+    /** The marks of batches the server took this session - what is kept on disk, oldest first. */
+    private val storedMarks = LinkedHashSet<String>()
+
+    /** Bumped by [wipe]: a batch read before it is never handed to the outbox. */
+    private var wipes = 0
 
     init {
         loadStored()
@@ -156,6 +239,10 @@ internal class FlagsManager(
     /** wipeData(): forget the answer and the reports, keep the listeners. */
     fun wipe() {
         synchronized(lock) {
+            // No exposure read before the wipe is sent: the queued batch goes,
+            // and one on the wire is not handed to the outbox (whose own
+            // entries the wipe discards with its other writes).
+            wipes++
             generation++
             pending = null
             flags = emptyMap()
@@ -163,6 +250,7 @@ internal class FlagsManager(
             fetchedAt = 0L
             used = false
             exposed.clear()
+            storedMarks.clear()
             exposedSession = null
         }
         save(null)
@@ -256,19 +344,25 @@ internal class FlagsManager(
         val session = sessionId()
         val mark = "$session|${subjectKey()}|$key|$variant"
         val body = requestBody()
+        // Waiting in the write outbox counts as exposed: looked up on a miss
+        // (once per flag and variant per session), outside the lock.
+        val known = synchronized(lock) { exposedSession == session && exposed.contains(mark) }
+        val waiting = !known && pendingExposures().any { exposureMarks(it).contains(mark) }
         var previous: PendingBatch? = null
         var schedule = false
         synchronized(lock) {
             useExposureSessionLocked(session)
+            if (waiting) exposed.add(mark)
             if (!exposed.add(mark)) return
             while (exposed.size > FLAG_EXPOSURE_MARKS_MAX) exposed.remove(exposed.first())
             val current = pending
             if (current == null || current.generation != generation) {
                 // A batch from before an identity change goes first, as its own person.
                 previous = current
-                pending = PendingBatch(body, generation)
+                pending = PendingBatch(body, generation, wipes)
             }
             pending!!.exposures.add(key to variant)
+            pending!!.marks.add(mark)
             if (!flushScheduled) {
                 flushScheduled = true
                 schedule = true
@@ -295,9 +389,40 @@ internal class FlagsManager(
     private fun send(batch: PendingBatch) {
         // Consent withdrawn since the reads: nothing is sent.
         if (batch.exposures.isEmpty() || !canSend()) return
+        val chunks = splitExposureBatch(batch).map { it to requestJson(it) }
+        // One request after the other, in reading order.
+        scope.launch { for ((chunk, json) in chunks) postBatch(chunk, json) }
+    }
+
+    /**
+     * One POST of [batch]. Its marks are stored only once the server took it
+     * ([exposureBatchSettled]); otherwise the write outbox gets it, with the
+     * same idempotencyKey.
+     */
+    private suspend fun postBatch(batch: PendingBatch, json: String) {
+        val answer = try {
+            postExposures(json)
+        } catch (e: Exception) {
+            log("Flag exposures failed: ${e.message}")
+            FlagsPostStatus(0)
+        }
+        // Taken - or refused for good (a 4xx other than 408 / 429): never sent again.
+        if (exposureBatchSettled(answer.status)) {
+            storeMarks(batch.marks)
+            return
+        }
+        // Not taken: the persisted outbox retries it, same body and key - unless
+        // the data was wiped or sending stopped (opt-out, consent) meanwhile.
+        if (synchronized(lock) { batch.wipe == wipes } && canSend()) enqueueExposures(json)
+    }
+
+    /** The write outbox settled an exposures batch (taken, or refused for good): its marks are stored. */
+    fun exposuresSettled(json: String) = storeMarks(exposureMarks(json))
+
+    private fun requestJson(batch: PendingBatch): String {
         val body = batch.body.deepCopy()
         val list = JsonArray()
-        batch.exposures.take(FLAG_EXPOSURES_PER_CALL_MAX).forEach { (k, v) ->
+        batch.exposures.forEach { (k, v) ->
             list.add(JsonObject().apply {
                 addProperty("key", k)
                 addProperty("variant", v)
@@ -305,17 +430,7 @@ internal class FlagsManager(
         }
         body.add("exposures", list)
         body.addProperty("idempotencyKey", batch.idempotencyKey)
-        val json = body.toString()
-        // Stored when the batch goes, not when it is queued: an app killed in
-        // the second before the flush has not reported it, so a relaunch must.
-        persistExposureMarks()
-        scope.launch {
-            try {
-                post("v1/flags/exposures", json)
-            } catch (e: Exception) {
-                log("Flag exposures failed: ${e.message}")
-            }
-        }
+        return body.toString()
     }
 
     private fun subjectKey(): String = "${userId() ?: ""}|${anonymousId()}"
@@ -459,6 +574,7 @@ internal class FlagsManager(
         if (exposedSession == session) return
         val first = exposedSession == null
         exposed.clear()
+        storedMarks.clear()
         exposedSession = session
         if (!first) return
         try {
@@ -466,21 +582,37 @@ internal class FlagsManager(
             val s = JsonParser.parseString(raw).asJsonObject
             if (s.str("sessionId") != session) return
             (s.get("marks") as? JsonArray)?.forEach { m ->
-                if (m is JsonPrimitive && m.isString) exposed.add(m.asString)
+                if (m is JsonPrimitive && m.isString) storedMarks.add(m.asString)
             }
-            while (exposed.size > FLAG_EXPOSURE_MARKS_MAX) exposed.remove(exposed.first())
+            while (storedMarks.size > FLAG_EXPOSURE_MARKS_MAX) storedMarks.remove(storedMarks.first())
+            exposed.addAll(storedMarks)
         } catch (e: Exception) {
             // Unreadable: start empty.
         }
     }
 
-    /** Store the current session's marks (JSON `{"sessionId", "marks"}`). */
-    private fun persistExposureMarks() {
+    /**
+     * The server took a batch (directly or through the outbox): its marks are
+     * stored, as JSON `{"sessionId", "marks"}`. Only the current session's
+     * and person's: a batch of the previous person (reset, another user)
+     * stores none.
+     */
+    private fun storeMarks(marks: List<String>) {
+        val subject = subjectKey()
+        val current = sessionId()
         val stored = synchronized(lock) {
+            // Settled by the outbox before this launch read a flag: the session's stored marks first.
+            useExposureSessionLocked(current)
             val session = exposedSession ?: return
+            val mine = marks.filter { it.startsWith("$session|$subject|") }
+            if (mine.isEmpty()) return
+            storedMarks.addAll(mine)
+            // Known as sent in this process too (an outbox settle can come before any read).
+            exposed.addAll(mine)
+            while (storedMarks.size > FLAG_EXPOSURE_MARKS_MAX) storedMarks.remove(storedMarks.first())
             JsonObject().apply {
                 addProperty("sessionId", session)
-                add("marks", JsonArray().also { a -> exposed.forEach { a.add(it) } })
+                add("marks", JsonArray().also { a -> storedMarks.forEach { a.add(it) } })
             }.toString()
         }
         try {
@@ -496,7 +628,10 @@ internal class FlagsManager(
      */
     fun clearExposureMarks() {
         synchronized(lock) {
+            // Batches already made still go, as the person who read them;
+            // their marks are not stored (storeMarks keeps the current person's only).
             exposed.clear()
+            storedMarks.clear()
             exposedSession = null
         }
         try {

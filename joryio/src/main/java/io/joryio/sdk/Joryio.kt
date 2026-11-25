@@ -563,9 +563,30 @@ class Joryio private constructor(
                 // have yet: the queued events are what create it.
                 onProfileMissing = { queueManager.flush(force = true) },
                 onDone = { entry -> onOutboxEntryDone(entry) },
+                // Refused for good: never sent again, so its marks are stored.
+                onDropped = { entry -> if (entry.kind == KIND_FLAG_EXPOSURES) flagsManager.exposuresSettled(entry.body) },
             ) { entry ->
                 val body = withCurrentUserId(entry.body)
                 val writer = userIdOf(body)
+                if (entry.kind == KIND_FLAG_EXPOSURES) {
+                    // One attempt per drain, no in-request retries: an attempt
+                    // never outlives a wipeData() or an opt-out by re-sending
+                    // itself. The outbox's own rules decide what comes next.
+                    val answer = networkClient.postFlagExposures(body)
+                    return@drain if (answer.status in 200..299) {
+                        io.joryio.sdk.core.OutboxResult.Done
+                    } else {
+                        io.joryio.sdk.core.OutboxResult.from(
+                            io.joryio.sdk.network.NetworkResult.Error(
+                                "HTTP ${answer.status}",
+                                isRetryable = true,
+                                code = answer.status.takeIf { it > 0 },
+                                retryAfterMs = answer.retryAfterMs,
+                            ),
+                            forCurrentUser = writer == null || isCurrentUser(writer),
+                        )
+                    }
+                }
                 val result = if (entry.kind == KIND_ATTRIBUTES) {
                     // One attribute request on the wire at a time: see
                     // attributeSendMutex.
@@ -591,8 +612,27 @@ class Joryio private constructor(
         }
     }
 
+    /**
+     * A flag exposures batch the server did not take: into the outbox as it
+     * was sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the
+     * oldest batch goes first), so exposures never crowd out the profile
+     * writes.
+     */
+    private fun enqueueFlagExposures(json: String) {
+        val incoming = io.joryio.sdk.flags.exposureMarks(json).size
+        while (true) {
+            val waiting = outbox.snapshot().filter { it.kind == KIND_FLAG_EXPOSURES }
+            if (waiting.isEmpty() || waiting.sumOf { io.joryio.sdk.flags.exposureMarks(it.body).size } + incoming <= io.joryio.sdk.flags.FLAG_EXPOSURE_MARKS_MAX) break
+            val oldest = waiting.first().id
+            outbox.removeIf { it.id == oldest }
+        }
+        outbox.add(io.joryio.sdk.network.OutboxEntry(java.util.UUID.randomUUID().toString(), KIND_FLAG_EXPOSURES, "v1/flags/exposures", json))
+        if (canSend()) scope.launch { drainOutbox() }
+    }
+
     private fun onOutboxEntryDone(entry: io.joryio.sdk.network.OutboxEntry) {
         when (entry.kind) {
+            KIND_FLAG_EXPOSURES -> flagsManager.exposuresSettled(entry.body)
             KIND_OPT_OUT_MARKER -> {
                 // What the server holds for the person on the device now. A
                 // logged-out user's marker reached THEIR profile, which says
@@ -915,6 +955,11 @@ class Joryio private constructor(
         flagsManager = io.joryio.sdk.flags.FlagsManager(
             scope = scope,
             post = { path, json -> networkClient.postFlags(path, json) },
+            postExposures = { json -> networkClient.postFlagExposures(json) },
+            // A batch the server did not take goes to the persisted outbox, as
+            // it was sent (1.4.0-beta.13); waiting there counts as exposed.
+            enqueueExposures = { json -> enqueueFlagExposures(json) },
+            pendingExposures = { outbox.snapshot().filter { it.kind == KIND_FLAG_EXPOSURES }.map { it.body } },
             canSend = { canSend() },
             userId = { identityManager.getUserId() },
             anonymousId = { identityManager.getAnonymousId() },
@@ -3797,6 +3842,13 @@ class Joryio private constructor(
          * opt-out's discard and a reset(), sent while opted out.
          */
         private const val KIND_OPT_OUT_MARKER = "opt_out_marker"
+
+        /**
+         * A flag exposures batch the server did not take at once (1.4.0-beta.13):
+         * the request body as sent, retried as it is; discarded with the other
+         * writes on an opt-out, a denied consent and wipeData().
+         */
+        private const val KIND_FLAG_EXPOSURES = "flag_exposures"
 
         /** A subscribe / opt-in: held and discarded with the other writes. */
         private const val KIND_SUBSCRIPTION = "subscription"

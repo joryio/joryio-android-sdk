@@ -31,6 +31,26 @@ class FlagsManagerTest {
         }
 
         fun calls(path: String) = calls.filter { it.first == path }.map { it.second }
+
+        /** What the next exposures requests answer: an HTTP status, or [NETWORK] for no answer. Then 200. */
+        val exposureAnswers = java.util.concurrent.ConcurrentLinkedQueue<Int>()
+
+        /** The request whose first exposure is this flag answers 503 once. */
+        @Volatile var failOnceStartingAt: String? = null
+
+        suspend fun postExposures(json: String): FlagsPostStatus {
+            val body = JsonParser.parseString(json).asJsonObject
+            calls.add("v1/flags/exposures" to body)
+            if (delayMs > 0) delay(delayMs)
+            val first = body["exposures"].asJsonArray.firstOrNull()?.asJsonObject?.get("key")?.asString
+            if (first != null && first == failOnceStartingAt) {
+                failOnceStartingAt = null
+                return FlagsPostStatus(503)
+            }
+            val status = exposureAnswers.poll() ?: 200
+            if (status == NETWORK) throw java.io.IOException("unexpected end of stream")
+            return FlagsPostStatus(status)
+        }
     }
 
     private class State {
@@ -41,6 +61,9 @@ class FlagsManagerTest {
         @Volatile var stored: String? = null
         @Volatile var exposures: String? = null
         @Volatile var now = 1_000_000L
+
+        /** The fake write outbox: the bodies handed to it. */
+        val outbox = CopyOnWriteArrayList<String>()
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -48,6 +71,9 @@ class FlagsManagerTest {
     private fun manager(server: Server, state: State) = FlagsManager(
         scope = scope,
         post = { p, j -> server.post(p, j) },
+        postExposures = { j -> server.postExposures(j) },
+        enqueueExposures = { j -> state.outbox.add(j) },
+        pendingExposures = { state.outbox.toList() },
         canSend = { state.canSend },
         userId = { state.userId },
         anonymousId = { state.anonymousId },
@@ -335,11 +361,127 @@ class FlagsManagerTest {
         val server = Server().apply { answer = """{"etag":"m","ttlSeconds":300,"flags":{$many}}""" }
         val (m, _, state) = ready(server)
         for (i in 0..FLAG_EXPOSURE_MARKS_MAX) m.getBoolFlag("f$i", false)
-        assertTrue(waitUntil { server.calls("v1/flags/exposures").isNotEmpty() && state.exposures != null })
+        // Stored once the server took each request of at most 100 (1.4.0-beta.13).
+        assertTrue(waitUntil { state.exposures?.contains("|f$FLAG_EXPOSURE_MARKS_MAX|on") == true })
         val marks = JsonParser.parseString(state.exposures).asJsonObject["marks"].asJsonArray.map { it.asString }
         assertEquals(FLAG_EXPOSURE_MARKS_MAX, marks.size)
         assertFalse("the oldest went first", marks.contains("s-1||anon-1|f0|on"))
         assertTrue(marks.contains("s-1||anon-1|f$FLAG_EXPOSURE_MARKS_MAX|on"))
+    }
+
+    // ── 1.4.0-beta.13: a mark is "sent" only once the server took its batch;
+    // one it did not take goes to the write outbox (here a fake one) ──
+
+    private fun marks(state: State): List<String> =
+        state.exposures?.let { JsonParser.parseString(it).asJsonObject["marks"].asJsonArray.map { m -> m.asString } } ?: emptyList()
+
+    @Test
+    fun `the rule - 2xx and a 4xx other than 408 or 429 settle a batch, the rest go to the outbox`() {
+        listOf(200, 202, 400, 401, 403, 404, 413, 422).forEach { assertTrue("$it", exposureBatchSettled(it)) }
+        listOf(0, 408, 429, 500, 502, 503).forEach { assertFalse("$it", exposureBatchSettled(it)) }
+    }
+
+    private fun failedGoesToTheOutbox(failure: Int) {
+        val (m, server, state) = ready()
+        server.exposureAnswers.add(failure)
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { state.outbox.size == 1 })
+        val sent = server.calls("v1/flags/exposures")
+        assertEquals(1, sent.size)
+        assertEquals("the same body and key", sent[0], JsonParser.parseString(state.outbox[0]).asJsonObject)
+        assertTrue("not marked before the server took it", marks(state).isEmpty())
+        // A read meanwhile, and a relaunch with it still waiting: no second copy.
+        m.getBoolFlag("new_checkout", false)
+        val again = relaunch(server, state)
+        again.getBoolFlag("new_checkout", false)
+        Thread.sleep(300)
+        assertEquals(1, server.calls("v1/flags/exposures").size)
+        assertEquals(1, state.outbox.size)
+        // The outbox delivered it.
+        again.exposuresSettled(state.outbox[0])
+        assertEquals(listOf("s-1||anon-1|new_checkout|on"), marks(state))
+    }
+
+    @Test
+    fun `after a network error the batch goes to the outbox as sent, counts as exposed across a relaunch, and is marked when settled`() = failedGoesToTheOutbox(NETWORK)
+
+    @Test
+    fun `after a 503 the batch goes to the outbox as sent, counts as exposed across a relaunch, and is marked when settled`() = failedGoesToTheOutbox(503)
+
+    @Test
+    fun `after a 429 the batch goes to the outbox as sent, counts as exposed across a relaunch, and is marked when settled`() = failedGoesToTheOutbox(429)
+
+    @Test
+    fun `a 2xx marks the batch and nothing goes to the outbox`() {
+        val (m, server, state) = ready()
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { state.exposures != null })
+        Thread.sleep(200)
+        assertEquals(1, server.calls("v1/flags/exposures").size)
+        assertTrue(state.outbox.isEmpty())
+    }
+
+    @Test
+    fun `a permanent 4xx marks the batch - nothing goes to the outbox`() {
+        val (m, server, state) = ready()
+        server.exposureAnswers.add(400)
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { state.exposures != null })
+        Thread.sleep(200)
+        assertEquals(1, server.calls("v1/flags/exposures").size)
+        assertTrue(state.outbox.isEmpty())
+    }
+
+    @Test
+    fun `150 exposures go as two requests of at most 100, a failed second one alone goes to the outbox`() {
+        val many = (0 until 150).joinToString(",") { i ->
+            """"f$i":{"value":true,"variant":"on","valueType":"boolean","reason":"rule","version":1,"logExposure":true}"""
+        }
+        val server = Server().apply {
+            answer = """{"etag":"m","ttlSeconds":300,"flags":{$many}}"""
+            failOnceStartingAt = "f100"
+        }
+        val (m, _, state) = ready(server)
+        for (i in 0 until 150) m.getBoolFlag("f$i", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 2 && state.outbox.size == 1 })
+        val sent = server.calls("v1/flags/exposures")
+        assertEquals(listOf(100, 50), sent.map { it["exposures"].asJsonArray.size() })
+        assertTrue(sent[0]["idempotencyKey"].asString != sent[1]["idempotencyKey"].asString)
+        assertEquals((0 until 150).map { "f$it" }, sent.flatMap { b -> b["exposures"].asJsonArray.map { it.asJsonObject["key"].asString } })
+        assertEquals(sent[1], JsonParser.parseString(state.outbox[0]).asJsonObject)
+        assertTrue(waitUntil { marks(state).size == 100 })
+        m.exposuresSettled(state.outbox[0])
+        assertEquals(150, marks(state).size)
+    }
+
+    @Test
+    fun `wipe - a queued batch is never sent, and one whose failed answer arrives after it is not handed to the outbox`() {
+        val (m, server, state) = ready()
+        m.getBoolFlag("new_checkout", false)
+        m.wipe() // wipeData()
+        Thread.sleep(300)
+        assertEquals(0, server.calls("v1/flags/exposures").size)
+        val again = manager(server, state).also { runBlocking { it.refreshFlags() } }
+        server.delayMs = 200
+        server.exposureAnswers.add(503)
+        again.getStringFlag("headline", "")
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 1 })
+        again.wipe()
+        Thread.sleep(500)
+        assertTrue(state.outbox.isEmpty())
+        assertNull(state.exposures)
+    }
+
+    @Test
+    fun `a failed batch is not handed to the outbox once sending stopped (opt-out, consent)`() {
+        val (m, server, state) = ready()
+        server.delayMs = 200
+        server.exposureAnswers.add(503)
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { server.calls("v1/flags/exposures").size == 1 })
+        state.canSend = false // opted out while it was on the wire
+        Thread.sleep(500)
+        assertTrue(state.outbox.isEmpty())
     }
 
     @Test
@@ -351,6 +493,9 @@ class FlagsManagerTest {
     data class Theme(val color: String)
 
     companion object {
+        /** A [Server.exposureAnswers] entry: no answer (a dropped connection). */
+        const val NETWORK = -1
+
         const val ANSWER = """{"etag":"e1","ttlSeconds":300,"flags":{
             "new_checkout":{"value":true,"variant":"on","valueType":"boolean","reason":"rule","version":1,"logExposure":true},
             "headline":{"value":"Hello","variant":"b","valueType":"string","reason":"rule","version":1,"logExposure":true},
