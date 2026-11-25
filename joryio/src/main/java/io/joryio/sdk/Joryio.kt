@@ -617,8 +617,12 @@ class Joryio private constructor(
      * was sent. At most FLAG_EXPOSURE_MARKS_MAX exposures wait there (the
      * oldest batch goes first), so exposures never crowd out the profile
      * writes.
+     *
+     * It counts as having failed once (1.4.0-beta.14): its first outbox
+     * attempt waits the first backoff step, or the failed send's Retry-After
+     * when longer - the drain below no longer re-sends it milliseconds later.
      */
-    private fun enqueueFlagExposures(json: String) {
+    private fun enqueueFlagExposures(json: String, retryAfterMs: Long? = null) {
         val incoming = io.joryio.sdk.flags.exposureMarks(json).size
         while (true) {
             val waiting = outbox.snapshot().filter { it.kind == KIND_FLAG_EXPOSURES }
@@ -626,7 +630,10 @@ class Joryio private constructor(
             val oldest = waiting.first().id
             outbox.removeIf { it.id == oldest }
         }
-        outbox.add(io.joryio.sdk.network.OutboxEntry(java.util.UUID.randomUUID().toString(), KIND_FLAG_EXPOSURES, "v1/flags/exposures", json))
+        outbox.addAfterFailedSend(
+            io.joryio.sdk.network.OutboxEntry(java.util.UUID.randomUUID().toString(), KIND_FLAG_EXPOSURES, "v1/flags/exposures", json),
+            retryAfterMs,
+        )
         if (canSend()) scope.launch { drainOutbox() }
     }
 
@@ -958,7 +965,7 @@ class Joryio private constructor(
             postExposures = { json -> networkClient.postFlagExposures(json) },
             // A batch the server did not take goes to the persisted outbox, as
             // it was sent (1.4.0-beta.13); waiting there counts as exposed.
-            enqueueExposures = { json -> enqueueFlagExposures(json) },
+            enqueueExposures = { json, retryAfterMs -> enqueueFlagExposures(json, retryAfterMs) },
             pendingExposures = { outbox.snapshot().filter { it.kind == KIND_FLAG_EXPOSURES }.map { it.body } },
             canSend = { canSend() },
             userId = { identityManager.getUserId() },

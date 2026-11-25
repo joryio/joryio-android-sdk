@@ -359,4 +359,19 @@ internal data class OutboxEntry(
      * alias, attribute ops, the opt-out marker) and in older outboxes.
      */
     @SerializedName("key") val key: String? = null,
+    /**
+     * Failed sends this write had before it reached the outbox (1.4.0-beta.14):
+     * 1 for a flag exposures batch whose own direct send failed, so the
+     * outbox's backoff after its first outbox attempt continues from there.
+     * Absent in an older outbox = 0.
+     */
+    @SerializedName("failures") val failures: Int = 0,
+    /**
+     * Epoch ms before which this write is not sent (1.4.0-beta.14): set when
+     * it was handed over after its own direct send failed - the first
+     * backoff step, or the server's Retry-After when longer. Only this entry
+     * waits (the drain steps past it to the writes behind it), and it is
+     * stored with the entry, so a relaunch waits it out too. 0 = no wait.
+     */
+    @SerializedName("firstAttemptNotBefore") val firstAttemptNotBefore: Long = 0,
 )

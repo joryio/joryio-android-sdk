@@ -204,10 +204,11 @@ class FlagsSdkTest {
         val sdk = init()
         refreshed(sdk)
         sdk.getBoolFlag("new_checkout", false)
-        // The direct attempt and the outbox's own first one (both 503) are through.
-        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") && exposureCalls().size >= 2 })
+        // The direct attempt (503) is through; the outbox waits before its own.
+        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") })
         pumpUntil(300) { false }
         val before = exposureCalls().size
+        assertEquals("no immediate re-send (1.4.0-beta.14)", 1, before)
         sdk.wipeData()
         assertTrue(!outboxOnDisk(sdk).contains("flag_exposures"))
         exposuresFail = false
@@ -222,10 +223,11 @@ class FlagsSdkTest {
         val sdk = init()
         refreshed(sdk)
         sdk.getBoolFlag("new_checkout", false)
-        // The direct attempt and the outbox's own first one (both 503) are through.
-        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") && exposureCalls().size >= 2 })
+        // The direct attempt (503) is through; the outbox waits before its own.
+        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") })
         pumpUntil(300) { false }
         val before = exposureCalls().size
+        assertEquals("no immediate re-send (1.4.0-beta.14)", 1, before)
         sdk.optOut()
         assertTrue(!outboxOnDisk(sdk).contains("flag_exposures"))
         sdk.optIn()
@@ -233,6 +235,80 @@ class FlagsSdkTest {
         kotlinx.coroutines.runBlocking { sdk.drainOutbox(force = true) }
         pumpUntil(1_500) { false }
         assertEquals(before, exposureCalls().size)
+    }
+
+    // ── 1.4.0-beta.14: no immediate re-send after a failed direct send ──
+
+    /** When each exposures request reached the server, and what it answered. */
+    private val exposureTimes = java.util.concurrent.CopyOnWriteArrayList<Long>()
+
+    private fun answerExposures(response: () -> okhttp3.mockwebserver.MockResponse) {
+        api.answers["/v1/flags/exposures"] = {
+            exposureTimes.add(System.currentTimeMillis())
+            response()
+        }
+    }
+
+    /** The stored flag exposures entries' first-attempt times. */
+    private fun storedNotBefore(sdk: Joryio): List<Long> =
+        com.google.gson.JsonParser.parseString(outboxOnDisk(sdk).ifEmpty { "[]" }).asJsonArray
+            .map { it.asJsonObject }
+            .filter { it["kind"].asString == "flag_exposures" }
+            .map { it["firstAttemptNotBefore"].asLong }
+
+    @Test
+    fun `a 503 on the direct send - no second attempt until the first backoff step is over`() {
+        answerExposures { TestServer.json("{}", 503) }
+        val sdk = init()
+        refreshed(sdk)
+        val before = System.currentTimeMillis()
+        sdk.getBoolFlag("new_checkout", false)
+        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") })
+        val failedAt = exposureTimes.first()
+        val notBefore = storedNotBefore(sdk).single()
+        assertTrue("waits the first step: ${notBefore - failedAt}", notBefore >= before + 4_000 && notBefore <= System.currentTimeMillis() + 4_000)
+        // Fails before: a second 503 came 2-20 ms after the first.
+        pumpUntil(1_500) { false }
+        assertEquals(1, exposureTimes.size)
+        // A forced drain (foreground, connectivity) does not skip it either.
+        kotlinx.coroutines.runBlocking { sdk.drainOutbox(force = true) }
+        assertEquals(1, exposureTimes.size)
+        answerExposures { TestServer.json("""{"success":true,"accepted":1,"dropped":0}""") }
+        assertTrue(pumpUntil { !outboxOnDisk(sdk).contains("flag_exposures") })
+        assertEquals(2, exposureTimes.size)
+        assertTrue("the outbox's attempt came ${exposureTimes[1] - failedAt} ms later", exposureTimes[1] - failedAt >= 4_000 - 50)
+        val keys = bodies("/v1/flags/exposures").map { it["idempotencyKey"].asString }
+        assertEquals("the same key", 1, keys.toSet().size)
+    }
+
+    @Test
+    fun `a 429 with Retry-After 10 - the next attempt is not before 10 s`() {
+        answerExposures { TestServer.json("{}", 429).setHeader("Retry-After", "10") }
+        val sdk = init()
+        refreshed(sdk)
+        val before = System.currentTimeMillis()
+        sdk.getBoolFlag("new_checkout", false)
+        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") })
+        val notBefore = storedNotBefore(sdk).single()
+        assertTrue("waits the Retry-After: ${notBefore - before}", notBefore >= before + 10_000 && notBefore <= System.currentTimeMillis() + 10_000)
+        pumpUntil(1_500) { false }
+        assertEquals(1, exposureTimes.size)
+    }
+
+    @Test
+    fun `a Retry-After given as an HTTP date is passed to the outbox`() {
+        val format = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
+            .apply { timeZone = java.util.TimeZone.getTimeZone("GMT") }
+        answerExposures { TestServer.json("{}", 503).setHeader("Retry-After", format.format(java.util.Date(System.currentTimeMillis() + 60_000))) }
+        val sdk = init()
+        refreshed(sdk)
+        val before = System.currentTimeMillis()
+        sdk.getBoolFlag("new_checkout", false)
+        assertTrue(pumpUntil { outboxOnDisk(sdk).contains("flag_exposures") })
+        // An HTTP date has whole seconds: allow the second it was cut to.
+        assertTrue(storedNotBefore(sdk).single() >= before + 58_000)
+        pumpUntil(1_000) { false }
+        assertEquals(1, exposureTimes.size)
     }
 
     /**

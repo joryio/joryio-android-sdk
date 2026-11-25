@@ -112,8 +112,12 @@ internal class FlagsManager(
     private val postExposures: suspend (json: String) -> FlagsPostStatus = { json ->
         FlagsPostStatus(if (post("v1/flags/exposures", json) != null) 200 else 0)
     },
-    /** Hand a batch the server did not take to the persisted write outbox (same body, same key). */
-    private val enqueueExposures: (json: String) -> Unit = {},
+    /**
+     * Hand a batch the server did not take to the persisted write outbox (same
+     * body, same key), with that answer's Retry-After: its first outbox
+     * attempt waits the first backoff step, or the Retry-After when longer.
+     */
+    private val enqueueExposures: (json: String, retryAfterMs: Long?) -> Unit = { _, _ -> },
     /** The bodies of the exposure batches waiting in the write outbox. */
     private val pendingExposures: () -> List<String> = { emptyList() },
     /** true when the SDK may send (initialized, consent granted, not opted out). */
@@ -413,7 +417,9 @@ internal class FlagsManager(
         }
         // Not taken: the persisted outbox retries it, same body and key - unless
         // the data was wiped or sending stopped (opt-out, consent) meanwhile.
-        if (synchronized(lock) { batch.wipe == wipes } && canSend()) enqueueExposures(json)
+        // Its first outbox attempt waits (it failed once, and the server may
+        // have said when to come back): never an immediate second send.
+        if (synchronized(lock) { batch.wipe == wipes } && canSend()) enqueueExposures(json, answer.retryAfterMs)
     }
 
     /** The write outbox settled an exposures batch (taken, or refused for good): its marks are stored. */

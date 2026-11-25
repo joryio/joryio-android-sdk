@@ -18,6 +18,112 @@ class WriteOutboxTest {
     private fun outbox() = WriteOutbox(storage = null, logger = logger, clock = { now })
     private fun entry(id: String, kind: String = "alias") = OutboxEntry(id, kind, "v1/$kind", """{"id":"$id"}""")
 
+    // ── 1.4.0-beta.14: a write handed over after its own direct send failed ──
+
+    private fun exposures(id: String) = OutboxEntry(id, "flag_exposures", "v1/flags/exposures", "{\"idempotencyKey\":\"$id\"}")
+
+    /** Drain once (forced: the outbox's own backoff is not what holds it); the ids sent and the wait returned. */
+    private fun drainOnce(box: WriteOutbox, answer: (OutboxEntry) -> OutboxResult = { OutboxResult.Done }): Pair<List<String>, Long?> = runBlocking {
+        val sent = mutableListOf<String>()
+        val wait = box.drain(force = true, canSend = { true }) { e -> sent.add(e.id); answer(e) }
+        sent to wait
+    }
+
+    @Test
+    fun `after a 503 on the direct send the first outbox attempt waits the first backoff step`() {
+        // Fails before: the kick after enqueue re-sent it 2-20 ms after the failure.
+        val box = outbox()
+        box.addAfterFailedSend(exposures("x"))
+        val (sent, wait) = drainOnce(box)
+        assertEquals(emptyList<String>(), sent)
+        assertEquals("the first backoff step (2 s x 2^1)", 4_000L, wait)
+        now += 3_999
+        assertEquals(emptyList<String>(), drainOnce(box).first)
+        now += 1
+        assertEquals(listOf("x"), drainOnce(box).first)
+        assertEquals(0, box.size())
+    }
+
+    @Test
+    fun `it counts as failed once - the backoff after its first outbox failure is the second step`() {
+        val box = outbox()
+        box.addAfterFailedSend(exposures("x"))
+        now += 4_000
+        val (sent, wait) = drainOnce(box) { OutboxResult.from(NetworkResult.Error("busy", true, code = 503)) }
+        assertEquals(listOf("x"), sent)
+        assertEquals(8_000L, wait)
+    }
+
+    @Test
+    fun `a 429 with Retry-After 10 - the next attempt is not before 10 s`() {
+        val box = outbox()
+        box.addAfterFailedSend(exposures("x"), retryAfterMs = 10_000)
+        assertEquals(10_000L, drainOnce(box).second)
+        now += 9_999
+        assertEquals(emptyList<String>(), drainOnce(box).first)
+        now += 1
+        assertEquals(listOf("x"), drainOnce(box).first)
+    }
+
+    @Test
+    fun `a Retry-After given as an HTTP date is honoured`() {
+        val box = outbox()
+        val date = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", java.util.Locale.US)
+            .apply { timeZone = java.util.TimeZone.getTimeZone("GMT") }
+            .format(java.util.Date(now + 30_000))
+        val retryAfter = io.joryio.sdk.network.NetworkClient.parseRetryAfterMs(date, now)
+        assertEquals(30_000L, retryAfter)
+        box.addAfterFailedSend(exposures("x"), retryAfter)
+        now += 29_999
+        assertEquals(emptyList<String>(), drainOnce(box).first)
+        now += 1
+        assertEquals(listOf("x"), drainOnce(box).first)
+    }
+
+    @Test
+    fun `a Retry-After longer than the outbox maximum is capped at it`() {
+        val box = outbox()
+        box.addAfterFailedSend(exposures("x"), retryAfterMs = 3_600_000)
+        assertEquals(WriteOutbox.MAX_BACKOFF_MS, drainOnce(box).second)
+        now += WriteOutbox.MAX_BACKOFF_MS
+        assertEquals(listOf("x"), drainOnce(box).first)
+    }
+
+    @Test
+    fun `only that entry waits - the writes queued before and after it go now`() {
+        val box = outbox()
+        box.add(entry("before", "identify"))
+        box.addAfterFailedSend(exposures("x"), retryAfterMs = 10_000)
+        box.add(entry("after", "alias"))
+        val (sent, wait) = drainOnce(box)
+        assertEquals(listOf("before", "after"), sent)
+        assertEquals(10_000L, wait)
+        assertEquals(1, box.size())
+    }
+
+    @Test
+    fun `the first wait is stored with the entry, so a relaunch waits it out too`() {
+        val gson = io.joryio.sdk.network.WireJson.gson
+        val box = outbox()
+        box.addAfterFailedSend(exposures("x"))
+        val stored = gson.toJson(box.snapshot())
+        val type = object : com.google.gson.reflect.TypeToken<List<OutboxEntry>>() {}.type
+        val restored: List<OutboxEntry> = gson.fromJson(stored, type)
+        assertEquals(now + 4_000, restored.single().firstAttemptNotBefore)
+        assertEquals(1, restored.single().failures)
+        // An outbox stored by an earlier build has neither field: no wait.
+        val old: List<OutboxEntry> = gson.fromJson("""[{"id":"o","kind":"alias","path":"v1/alias","body":"{}"}]""", type)
+        assertEquals(0L, old.single().firstAttemptNotBefore)
+        assertEquals(0, old.single().failures)
+    }
+
+    @Test
+    fun `a first wait further away than the maximum means the clock moved - it goes now`() {
+        val box = outbox()
+        box.add(exposures("x").copy(firstAttemptNotBefore = now + WriteOutbox.MAX_BACKOFF_MS + 1))
+        assertEquals(listOf("x"), drainOnce(box).first)
+    }
+
     @Test
     fun `a write refused with 403 is dropped and the next one goes out`() = runBlocking {
         // Scan 3 finding 2. Fails before: 403 was Retry, the head of an

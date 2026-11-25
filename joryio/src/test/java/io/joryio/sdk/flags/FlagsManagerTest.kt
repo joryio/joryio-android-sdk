@@ -35,6 +35,9 @@ class FlagsManagerTest {
         /** What the next exposures requests answer: an HTTP status, or [NETWORK] for no answer. Then 200. */
         val exposureAnswers = java.util.concurrent.ConcurrentLinkedQueue<Int>()
 
+        /** The Retry-After (ms) the next failed exposures answers carry. */
+        @Volatile var retryAfterMs: Long? = null
+
         /** The request whose first exposure is this flag answers 503 once. */
         @Volatile var failOnceStartingAt: String? = null
 
@@ -49,7 +52,7 @@ class FlagsManagerTest {
             }
             val status = exposureAnswers.poll() ?: 200
             if (status == NETWORK) throw java.io.IOException("unexpected end of stream")
-            return FlagsPostStatus(status)
+            return FlagsPostStatus(status, if (status in 200..299) null else retryAfterMs)
         }
     }
 
@@ -64,6 +67,7 @@ class FlagsManagerTest {
 
         /** The fake write outbox: the bodies handed to it. */
         val outbox = CopyOnWriteArrayList<String>()
+        val enqueuedRetryAfter = CopyOnWriteArrayList<Long?>()
     }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -72,7 +76,7 @@ class FlagsManagerTest {
         scope = scope,
         post = { p, j -> server.post(p, j) },
         postExposures = { j -> server.postExposures(j) },
-        enqueueExposures = { j -> state.outbox.add(j) },
+        enqueueExposures = { j, retryAfterMs -> state.outbox.add(j); state.enqueuedRetryAfter.add(retryAfterMs) },
         pendingExposures = { state.outbox.toList() },
         canSend = { state.canSend },
         userId = { state.userId },
@@ -410,6 +414,19 @@ class FlagsManagerTest {
 
     @Test
     fun `after a 429 the batch goes to the outbox as sent, counts as exposed across a relaunch, and is marked when settled`() = failedGoesToTheOutbox(429)
+
+    @Test
+    fun `the failed answer's Retry-After is handed to the outbox with the batch (1_4_0-beta_14)`() {
+        val (m, server, state) = ready()
+        server.exposureAnswers.add(429)
+        server.retryAfterMs = 10_000
+        m.getBoolFlag("new_checkout", false)
+        assertTrue(waitUntil { state.outbox.size == 1 })
+        assertEquals(listOf<Long?>(10_000L), state.enqueuedRetryAfter.toList())
+        // Handed over once: the FlagsManager never re-sends it itself.
+        Thread.sleep(200)
+        assertEquals(1, server.calls("v1/flags/exposures").size)
+    }
 
     @Test
     fun `a 2xx marks the batch and nothing goes to the outbox`() {
