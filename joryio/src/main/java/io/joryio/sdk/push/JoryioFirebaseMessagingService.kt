@@ -1,6 +1,7 @@
 package io.joryio.sdk.push
 
 import android.app.NotificationChannel
+import io.joryio.sdk.flags.FLAG_SYNC_PUSH_VALUE
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -79,13 +80,14 @@ class JoryioFirebaseMessagingService : FirebaseMessagingService() {
         val syncType = remoteMessage.data[PushPayloadKeys.SYNC]
         if (!syncType.isNullOrEmpty()) {
             when (syncType) {
-                "campaigns", "in_app" -> {
-                    // whenReady, never getInstance(): a nudge that wakes a dead
-                    // app arrives while initializeAsync is still running, and
-                    // getInstance() THREW here - a crash in the host app,
-                    // triggered remotely by our own push.
-                    Joryio.whenReady { it.syncInAppCampaigns() }
+                "campaigns", "in_app", "placements" -> {
+                    // whenReady, never getInstance(): a nudge waking a dead app
+                    // arrives during initializeAsync, and getInstance() threw.
+                    Joryio.whenReady { if (syncType != "placements") it.syncInAppCampaigns(); it.refreshPlacements() }
                 }
+                // A new card (D444 Phase 3): fetch the feed again.
+                "cards" -> Joryio.whenReady { it.refreshCards() }
+                FLAG_SYNC_PUSH_VALUE -> Joryio.whenReady { it.onFlagsSyncPush() } // D446
                 else -> {
                     // Named rather than silently ignored: an unknown type means
                     // the backend and the SDK disagree, which is worth seeing.

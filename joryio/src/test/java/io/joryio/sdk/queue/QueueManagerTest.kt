@@ -9,7 +9,10 @@ import io.joryio.sdk.network.NetworkResult
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import org.junit.Test
 
 /** An in-memory EventDao, so the queue's decisions are tested without a device. */
@@ -28,6 +31,7 @@ internal class FakeEventDao : EventDao {
     override suspend fun deleteByIds(ids: List<Long>) { synchronized(rows) { rows.removeAll { it.id in ids } } }
     override suspend fun deleteAll() { synchronized(rows) { rows.clear() } }
     override suspend fun getCount(): Int = synchronized(rows) { rows.size }
+    override suspend fun countByEventId(eventId: String): Int = synchronized(rows) { rows.count { it.eventId == eventId } }
     override suspend fun queuedUserIds(): List<String> = synchronized(rows) { rows.mapNotNull { it.userId }.distinct() }
     override suspend fun deleteOldest(count: Int) {
         synchronized(rows) { rows.sortedBy { it.id }.take(count).map { it.id }.toSet().let { d -> rows.removeAll { it.id in d } } }
@@ -188,6 +192,56 @@ class QueueManagerTest {
         assertEquals(listOf(listOf("new")), sent)
     }
 
+    /**
+     * An optOut() that lands after a flush read its rows and before the request
+     * starts. Before the fix the rows read under the old generation went out
+     * anyway - and with an optIn() right after (a consent toggle flipped twice)
+     * nothing in the flush noticed: an event tracked before optOut() was sent
+     * or dropped depending on where the periodic flush happened to be.
+     */
+    @Test
+    fun `rows read before an opt-out are never sent by a request that starts after it`() = runBlocking {
+        val inner = FakeEventDao()
+        var onRead: (() -> Unit)? = null
+        val hooked = object : EventDao by inner {
+            override suspend fun getEvents(limit: Int): List<EventEntity> =
+                inner.getEvents(limit).also { onRead?.invoke() }
+        }
+        val q = QueueManager(
+            eventDao = hooked,
+            logger = Logger(false, LogLevel.ERROR),
+            batchSize = 50,
+            flushInterval = 60_000,
+            maxQueueSize = 1000,
+            clock = { now },
+        )
+        queue = q
+        q.stopAutoFlush()
+        q.onFlush = { batch ->
+            sent.add(batch.events.map { it.type })
+            BatchSendResult.Accepted
+        }
+        q.enqueue(event("tracked before optOut"))
+        // optOut() then optIn() at once, between the read and the request:
+        // the clear is requested and sending is allowed again.
+        onRead = {
+            onRead = null
+            q.paused = true
+            q.requestClear()
+            q.paused = false
+        }
+        q.flush(force = true)
+        q.flush(force = true)
+        assertEquals("nothing tracked before the opt-out is sent", emptyList<List<String>>(), sent)
+        assertEquals(emptyList<String>(), inner.rows.map { it.type })
+
+        // And while the opt-out holds, a batch read before it waits too.
+        q.enqueue(event("x"))
+        onRead = { onRead = null; q.paused = true }
+        q.flush(force = true)
+        assertEquals(emptyList<List<String>>(), sent)
+    }
+
     @Test
     fun `responses map onto the contract`() {
         assertEquals(BatchSendResult.Accepted, BatchSendResult.from(NetworkResult.Success(BatchResponse(success = true, processed = 1))))
@@ -289,5 +343,52 @@ class QueueManagerTest {
         q.stopAutoFlush()
         queue = q
         assertEquals(QueueManager.MIN_FLUSH_INTERVAL_MS, q.effectiveFlushIntervalMs)
+    }
+
+    // ── "Show when" re-check gate (D465) ────────────────────────────────
+
+    /**
+     * An event queued while a flush is already sending: deliver() waits for that
+     * flush, flushes again, and answers true only once the event left the queue.
+     */
+    @Test
+    fun `deliver waits for the flush in flight, then flushes again`() = runBlocking {
+        val gate = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val started = kotlinx.coroutines.CompletableDeferred<Unit>()
+        var first = true
+        val q = queue { BatchSendResult.Accepted }
+        q.onFlush = { batch ->
+            sent.add(batch.events.map { it.type })
+            if (first) { first = false; started.complete(Unit); gate.await() }
+            BatchSendResult.Accepted
+        }
+        q.enqueue(event("first"))
+        val inFlight = launch(kotlinx.coroutines.Dispatchers.IO) { q.flush(force = true) }
+        started.await()
+        val cart = event("add_to_cart")
+        q.enqueue(cart)
+        assertTrue(q.isQueued(cart.eventId))
+        val delivered = async(kotlinx.coroutines.Dispatchers.IO) { q.deliver(cart.eventId) }
+        kotlinx.coroutines.delay(150)
+        assertEquals("nothing more is sent while the first flush is in flight", 1, sent.size)
+        gate.complete(Unit)
+        inFlight.join()
+        assertTrue(delivered.await())
+        assertFalse(q.isQueued(cart.eventId))
+        assertEquals(listOf(listOf("first"), listOf("add_to_cart")), sent.toList())
+    }
+
+    /** A failed flush keeps the event: deliver() says so (the caller waits for the next flush). */
+    @Test
+    fun `deliver answers false while the event is still queued, and afterFlush fires`() = runBlocking {
+        var flushed = 0
+        val q = queue { BatchSendResult.Retry(retryAfterMs = 60_000) }
+        q.afterFlush = { flushed++ }
+        val cart = event("add_to_cart")
+        q.enqueue(cart)
+        assertFalse(q.deliver(cart.eventId))
+        assertTrue(q.isQueued(cart.eventId))
+        assertEquals("the backoff holds the retries", 1, sent.size)
+        assertEquals("only a flush that ran", 1, flushed)
     }
 }

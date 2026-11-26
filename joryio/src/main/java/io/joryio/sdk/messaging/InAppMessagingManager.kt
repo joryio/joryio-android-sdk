@@ -55,6 +55,11 @@ internal class InAppMessagingManager(
     // whatever thread the host tracks from.
     @Volatile
     private var campaigns: List<InAppCampaign> = emptyList()
+
+    /** The clock behind `time_on_screen` triggers (ScreenClock.kt). */
+    internal var screenClock = ScreenClock()
+    /** The pending time_on_screen check. */
+    private var screenCheckJob: Job? = null
     private var lastSyncTime: Date? = null
 
     /**
@@ -148,6 +153,24 @@ internal class InAppMessagingManager(
         if (isSyncing.get()) syncAgainRequested = true
     }
 
+    /**
+     * Form tokens of messages handed to the presenter or a host handler, by
+     * campaign id. A re-check campaign gets its token from the display-time
+     * resolve, which is not in [campaigns].
+     */
+    private val presentedFormTokens = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * The form token the server served with this campaign (BACKLOG D371 item
+     * 4), for the form submit: the presented copy first, else the synced one.
+     */
+    internal fun rememberFormToken(campaign: InAppCampaign) {
+        campaign.formToken?.let { presentedFormTokens[campaign.id] = it }
+    }
+
+    fun formTokenFor(campaignId: String): String? =
+        presentedFormTokens[campaignId] ?: campaigns.firstOrNull { it.id == campaignId }?.formToken
+
     suspend fun sync() {
         if (!canSend()) {
             logger.debug("In-app sync skipped: consent pending or opted out")
@@ -184,11 +207,19 @@ internal class InAppMessagingManager(
                 // SDK's own views with no WebView involved. HTML appears only
                 // when the integration opted in, because for everyone else it
                 // genuinely cannot display.
-                capabilities = hostCapabilities ?: if (allowHtmlJsInAppMessages) {
-                    listOf("content.native", "content.html")
-                } else {
-                    listOf("content.native")
-                }
+                // `placements` + `content.data`: this build draws placements
+                // and hands their data to the app; `cards`: it reads the card
+                // feed - the words every SDK sends.
+                // `screen_context`: this manager runs the screen clock for
+                // `time_on_screen` triggers - also when a host draws, because
+                // the triggers are still evaluated here.
+                capabilities = ScreenClock.withCapability(
+                    hostCapabilities ?: if (allowHtmlJsInAppMessages) {
+                        listOf("content.native", "placements", "content.data", "cards", "content.html")
+                    } else {
+                        listOf("content.native", "placements", "content.data", "cards")
+                    },
+                ),
             )
 
             when (val result = networkClient.syncInAppMessages(request)) {
@@ -225,6 +256,7 @@ internal class InAppMessagingManager(
 
                     // Evaluate and display campaigns
                     evaluateAndDisplay()
+                    scheduleScreenCheck()
                 }
                 is NetworkResult.Error -> {
                     logger.error("Failed to sync campaigns: ${result.message}")
@@ -431,6 +463,7 @@ internal class InAppMessagingManager(
     /** Hand a campaign (already resolved, if it needed it) to the presenter. */
     private fun presentResolved(campaign: InAppCampaign) {
         logger.info("Displaying campaign: ${campaign.name}")
+        rememberFormToken(campaign)
 
         val delaySeconds = campaign.delay ?: 0
         if (delaySeconds > 0) {
@@ -790,6 +823,10 @@ internal class InAppMessagingManager(
      */
     fun clear() {
         invalidate()
+        // reset() / wipeData(): the served form tokens belong to the visitor
+        // that is going away. NOT on identify: the anonymousId stays, the
+        // server accepts the token for it, and every SDK keeps it there.
+        presentedFormTokens.clear()
         scope.coroutineContext.cancelChildren()
         synchronized(claims) { claims.clear() }
         campaigns = emptyList()
@@ -978,6 +1015,88 @@ internal class InAppMessagingManager(
             logger.info("Attribute threshold triggered campaign: ${match.name}")
             displayCampaign(match)
         }
+    }
+
+    // MARK: - time_on_screen (ScreenClock.kt)
+
+    /**
+     * The app reported a screen (`trackScreen` -> `Screen Viewed`). A new
+     * screen restarts the time_on_screen clock and re-arms every campaign
+     * waiting on it; the same screen again changes nothing.
+     */
+    fun onScreenViewed(screenName: String) {
+        if (screenClock.enter(screenName)) scheduleScreenCheck()
+    }
+
+    /** The app came to the foreground: the clock resumes (not restarts). */
+    fun onForeground() {
+        screenClock.resume()
+        scheduleScreenCheck()
+    }
+
+    /** The app went to the background: background time does not count. */
+    fun onBackground() {
+        screenClock.pause()
+        screenCheckJob?.cancel()
+        screenCheckJob = null
+    }
+
+    /** Milliseconds still to wait for the nearest time_on_screen trigger on this screen, null = none waits. */
+    internal fun nextScreenDeadlineMs(): Long? {
+        if (!screenClock.isVisible) return null
+        val elapsed = screenClock.seconds
+        val current = screenClock.name
+        var next: Double? = null
+        for (campaign in campaigns) {
+            if (screenClock.hasFired(campaign.id)) continue
+            for (t in campaign.triggers ?: emptyList()) {
+                val need = ScreenClock.thresholdSeconds(t) ?: continue
+                if (!ScreenClock.screenNameMatches(t["screenName"] as? String, current)) continue
+                val wait = maxOf(0.0, need - elapsed)
+                next = minOf(next ?: wait, wait)
+            }
+        }
+        return next?.let { (it * 1000).toLong() }
+    }
+
+    /** Arm one timer for the nearest time_on_screen deadline (none while backgrounded). */
+    internal fun scheduleScreenCheck() {
+        screenCheckJob?.cancel()
+        screenCheckJob = null
+        val wait = nextScreenDeadlineMs() ?: return
+        screenCheckJob = scope.launch {
+            delay(wait + 50)
+            screenCheckDue()
+        }
+    }
+
+    /**
+     * The campaigns whose time_on_screen is reached now, on this screen, and
+     * not yet fired for this visit - marked fired, and the best one shown
+     * through the ONE display routine (caps, gap, claim), like every other
+     * trigger. Returns the ids that fired.
+     */
+    internal fun screenCheckDue(): List<String> {
+        if (!screenClock.isVisible) return emptyList()
+        val elapsed = screenClock.seconds
+        val current = screenClock.name
+        val due = campaigns.sortedByDescending { it.priority }.filter { campaign ->
+            !screenClock.hasFired(campaign.id) && (campaign.triggers ?: emptyList()).any { t ->
+                val need = ScreenClock.thresholdSeconds(t)
+                need != null && ScreenClock.screenNameMatches(t["screenName"] as? String, current) && elapsed + 0.001 >= need
+            }
+        }
+        due.forEach { screenClock.markFired(it.id) }
+        due.firstOrNull { shouldDisplayCampaign(it) }?.let {
+            logger.info("Time on screen triggered campaign: ${it.name}")
+            displayCampaign(it)
+        }
+        scheduleScreenCheck()
+        return due.map { it.id }
+    }
+
+    internal fun setCampaignsForTesting(list: List<InAppCampaign>) {
+        campaigns = list
     }
 }
 

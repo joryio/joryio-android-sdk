@@ -209,6 +209,10 @@ internal class QueueManager(
     /** Sends one batch and reports what the server said. */
     var onFlush: (suspend (EventBatch) -> BatchSendResult)? = null
 
+    /** Called after every flush that ran (not one skipped): "Show when" re-checks waiting for their event. */
+    @Volatile
+    var afterFlush: () -> Unit = {}
+
     /**
      * Row count of the events table, refreshed after every write.
      *
@@ -331,9 +335,12 @@ internal class QueueManager(
             clearIfRequested()
             var rounds = 0
             while (rounds++ < MAX_BATCHES_PER_FLUSH && !paused && !suspendedForSession) {
+                // Taken BEFORE the read: rows read under one generation are
+                // never sent under the next (see [sendChunk]).
+                val readAt = generation
                 val entities = eventDao.getEvents(batchSize)
                 if (entities.isEmpty()) break
-                if (!sendChunk(withinByteLimit(sameUser(entities)))) break
+                if (!sendChunk(withinByteLimit(sameUser(entities)), readAt)) break
             }
             refreshCount()
         } catch (e: Exception) {
@@ -341,7 +348,28 @@ internal class QueueManager(
         } finally {
             flushMutex.unlock()
         }
+        runCatching { afterFlush() }
     }
+
+    /**
+     * A "Show when" re-check (D465) must not reach the server before its event:
+     * true once the event (its client eventId) has left the queue - sent by the
+     * flush in flight (waited for) or by one more. False while it is still
+     * queued (a failure, a backoff, sending paused): the caller waits for the
+     * next flush ([afterFlush]).
+     */
+    suspend fun deliver(eventId: String): Boolean {
+        repeat(3) {
+            if (!isQueued(eventId)) return true
+            flushMutex.withLock { } // the flush in flight, if any, ends first
+            flush()
+        }
+        return !isQueued(eventId)
+    }
+
+    /** Is this event still queued? An error answers true (the re-check waits rather than run early). */
+    suspend fun isQueued(eventId: String): Boolean =
+        try { eventDao.countByEventId(eventId) > 0 } catch (e: Exception) { true }
 
     /**
      * The leading events that belong to ONE user (contract item 30). A batch
@@ -388,7 +416,7 @@ internal class QueueManager(
      * Send one chunk and apply the outcome. True when the queue may continue
      * with the next chunk.
      */
-    private suspend fun sendChunk(entities: List<EventEntity>): Boolean {
+    private suspend fun sendChunk(entities: List<EventEntity>, readAt: Int): Boolean {
         val sender = onFlush ?: return false
 
         // A row that cannot be decoded can never be sent; it must not block
@@ -402,6 +430,16 @@ internal class QueueManager(
         }
         if (decoded.isEmpty()) return true
 
+        // An optOut() (or a denial) since these rows were read discards them,
+        // and no request may start with them after it - also when optIn()
+        // followed at once, which lifts [paused] again. Checked last, right
+        // before the request: an event tracked before optOut() goes out only
+        // in a request that had already started when optOut() was called
+        // (the same rule as iOS and web).
+        if (paused || generation != readAt) {
+            logger.debug("Queue cleared or paused since this batch was read; not sending it")
+            return false
+        }
         val ids = decoded.map { it.first.id }
         logger.debug("Sending batch of ${decoded.size} events")
         val outcome = sender(EventBatch(events = decoded.map { it.second }, sentAt = Date()))
@@ -478,7 +516,7 @@ internal class QueueManager(
                     val mid = decoded.size / 2
                     val first = decoded.subList(0, mid).map { it.first }
                     val second = decoded.subList(mid, decoded.size).map { it.first }
-                    sendChunk(first) && sendChunk(second)
+                    sendChunk(first, readAt) && sendChunk(second, readAt)
                 }
             }
             is BatchSendResult.Suspended -> {

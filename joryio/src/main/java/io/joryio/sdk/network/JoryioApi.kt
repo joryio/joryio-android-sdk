@@ -40,6 +40,16 @@ internal interface JoryioApi {
     ): Response<IdentifyResponse>
 
     /**
+     * Click-link identity: attach this anonymous visitor to the contact a
+     * tracked message link was sent to (the `jr_t` token). Same base URL,
+     * headers and SDK-key auth as `v1/identify`. See core/ClickIdentity.kt.
+     */
+    @POST("v1/identify-link")
+    suspend fun identifyLink(
+        @Body request: IdentifyLinkRequest
+    ): Response<IdentifyLinkResponse>
+
+    /**
      * Attach a labelled identifier (a loyalty number, a CRM id) to this person.
      *
      * Works for anonymous visitors too (shared SDK contract item 2): the
@@ -88,6 +98,18 @@ internal interface JoryioApi {
     ): Response<ResolveResponse>
 
     /** Track in-app message impression. */
+    /** Placements (docs/PLACEMENTS_PLAN.md 3.5): the body is built and read as raw JSON. */
+    @POST("v1/in-app/placements")
+    suspend fun fetchPlacements(
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
+    /** Content cards (docs/PLACEMENTS_PLAN.md 11.3): the body is built and read as raw JSON. */
+    @POST("v1/in-app/cards")
+    suspend fun fetchCards(
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
     @POST("v1/in-app/track")
     suspend fun trackImpression(
         @Body request: TrackImpressionRequest
@@ -122,6 +144,13 @@ internal interface JoryioApi {
      * has no SDK key. It used to be a relative path under the `/api/` base URL
      * and 404ed on production for every Android push.
      */
+    /** Feature flags (flags/FlagsManager.kt): the body is built and read as raw JSON. */
+    @POST
+    suspend fun postFlags(
+        @Url path: String,
+        @Body body: okhttp3.RequestBody,
+    ): Response<okhttp3.ResponseBody>
+
     /** A body serialised earlier, replayed verbatim (the write outbox). */
     @POST
     suspend fun postJson(
@@ -205,6 +234,21 @@ internal data class IdentifyRequest(
     @SerializedName("anonymousId") val anonymousId: String,
     @SerializedName("attributes") val attributes: Map<String, Any?>? = null,
     @SerializedName("timestamp") val timestamp: java.util.Date = java.util.Date()
+)
+
+/**
+ * Body of POST /v1/identify-link: exactly these two keys, on every SDK.
+ * `token` is the `jr_t` value - held in memory only, never persisted or logged.
+ */
+internal data class IdentifyLinkRequest(
+    @SerializedName("token") val token: String,
+    @SerializedName("anonymousId") val anonymousId: String,
+)
+
+/** `status` is "ok" or "ignored"; the SDK acts the same on both. */
+internal data class IdentifyLinkResponse(
+    @SerializedName("success") val success: Boolean? = null,
+    @SerializedName("status") val status: String? = null,
 )
 
 /**
@@ -315,4 +359,19 @@ internal data class OutboxEntry(
      * alias, attribute ops, the opt-out marker) and in older outboxes.
      */
     @SerializedName("key") val key: String? = null,
+    /**
+     * Failed sends this write had before it reached the outbox (1.4.0-beta.14):
+     * 1 for a flag exposures batch whose own direct send failed, so the
+     * outbox's backoff after its first outbox attempt continues from there.
+     * Absent in an older outbox = 0.
+     */
+    @SerializedName("failures") val failures: Int = 0,
+    /**
+     * Epoch ms before which this write is not sent (1.4.0-beta.14): set when
+     * it was handed over after its own direct send failed - the first
+     * backoff step, or the server's Retry-After when longer. Only this entry
+     * waits (the drain steps past it to the writes behind it), and it is
+     * stored with the entry, so a relaunch waits it out too. 0 = no wait.
+     */
+    @SerializedName("firstAttemptNotBefore") val firstAttemptNotBefore: Long = 0,
 )

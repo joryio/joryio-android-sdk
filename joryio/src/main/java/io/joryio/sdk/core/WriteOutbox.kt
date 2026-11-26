@@ -198,6 +198,33 @@ internal class WriteOutbox(
         }
     }
 
+    /**
+     * Queue a write whose own direct send just failed (no answer, 5xx, 408,
+     * 429 - a flag exposures batch, 1.4.0-beta.14). It counts as having failed
+     * once: its first outbox attempt waits the first backoff step
+     * ([baseBackoffMs] x 2), or [retryAfterMs] - the failed send's
+     * Retry-After - when longer, capped at [MAX_BACKOFF_MS]. The kick that
+     * follows an add used to re-send it a few milliseconds after the failure.
+     * Only this entry waits: the writes already queued go as before.
+     */
+    fun addAfterFailedSend(entry: OutboxEntry, retryAfterMs: Long? = null) {
+        val wait = firstRetryDelayMs(retryAfterMs)
+        add(entry.copy(failures = maxOf(entry.failures, 1), firstAttemptNotBefore = clock() + wait))
+    }
+
+    /** The wait before a write that failed once is tried again: the first backoff step, or a longer Retry-After. */
+    internal fun firstRetryDelayMs(retryAfterMs: Long? = null): Long =
+        maxOf(baseBackoffMs * 2, (retryAfterMs ?: 0L).coerceIn(0L, MAX_BACKOFF_MS)).coerceAtMost(MAX_BACKOFF_MS)
+
+    /**
+     * Is [entry] still waiting out its first wait ([OutboxEntry.firstAttemptNotBefore])?
+     * One further away than [MAX_BACKOFF_MS] means the clock moved: it goes now.
+     */
+    private fun waitingFirstAttempt(entry: OutboxEntry, now: Long): Boolean {
+        val at = entry.firstAttemptNotBefore
+        return at > now && at - now <= MAX_BACKOFF_MS
+    }
+
     /** Write the held entries to disk again (after the store was cleared under them). */
     fun persist() {
         synchronized(lock) { persistLocked() }
@@ -261,6 +288,7 @@ internal class WriteOutbox(
      * @param onProfileMissing runs before a 404'd write is retried - the
      *   caller flushes the event queue, which is what creates the profile.
      * @param onDone an entry the server acknowledged.
+     * @param onDropped an entry given up on (refused, or out of attempts).
      * @return the delay after which a retry should run, or null when there is
      *   nothing left to retry (drained, or sending is not allowed - consent
      *   pending / opted out, which have their own release triggers).
@@ -270,6 +298,7 @@ internal class WriteOutbox(
         canSend: (OutboxEntry) -> Boolean,
         onProfileMissing: suspend () -> Unit = {},
         onDone: (OutboxEntry) -> Unit = {},
+        onDropped: (OutboxEntry) -> Unit = {},
         send: suspend (OutboxEntry) -> OutboxResult,
     ): Long? {
         val now = clock()
@@ -282,7 +311,7 @@ internal class WriteOutbox(
             }
             val wait = try {
                 drainAgain = false
-                drainLocked(canSend, onProfileMissing, onDone, send)
+                drainLocked(canSend, onProfileMissing, onDone, onDropped, send)
             } finally {
                 drainMutex.unlock()
             }
@@ -294,6 +323,7 @@ internal class WriteOutbox(
         canSend: (OutboxEntry) -> Boolean,
         onProfileMissing: suspend () -> Unit,
         onDone: (OutboxEntry) -> Unit,
+        onDropped: (OutboxEntry) -> Unit,
         send: suspend (OutboxEntry) -> OutboxResult,
     ): Long? {
         // Set by a 402 on a non-withdrawal (contract item 50; scan 5, Android
@@ -306,8 +336,10 @@ internal class WriteOutbox(
         // retried after the backoff this returns.
         var suspendedWait: Long? = null
         while (true) {
-            val entry = nextSendable { canSend(it) && (suspendedWait == null || isWithdrawal(it)) }
-                ?: return suspendedWait
+            val now = clock()
+            val entry = nextSendable {
+                canSend(it) && (suspendedWait == null || isWithdrawal(it)) && !waitingFirstAttempt(it, now)
+            } ?: return listOfNotNull(suspendedWait, firstAttemptWait(canSend, now)).minOrNull()
             when (val outcome = send(entry)) {
                 is OutboxResult.Done -> {
                     remove(entry)
@@ -322,6 +354,11 @@ internal class WriteOutbox(
                 is OutboxResult.Drop -> {
                     remove(entry)
                     logger.error("Server refused a ${entry.kind} write (${outcome.reason}); dropped")
+                    try {
+                        onDropped(entry)
+                    } catch (e: Exception) {
+                        logger.warn("Outbox drop hook failed: ${e.message}")
+                    }
                 }
                 is OutboxResult.Retry -> {
                     if (outcome.suspended && !isWithdrawal(entry)) {
@@ -350,6 +387,11 @@ internal class WriteOutbox(
                             logger.error(
                                 "${entry.kind} write still refused after $attempts attempts (${outcome.reason}); dropped",
                             )
+                            try {
+                                onDropped(entry)
+                            } catch (e: Exception) {
+                                logger.warn("Outbox drop hook failed: ${e.message}")
+                            }
                             continue
                         }
                         replace(entry.copy(attempts = attempts))
@@ -361,7 +403,9 @@ internal class WriteOutbox(
                             logger.warn("Could not flush events before retrying a ${entry.kind} write: ${e.message}")
                         }
                     }
-                    failures++
+                    // A write handed over after its own failed send has
+                    // failed before: the backoff goes on from there.
+                    failures = maxOf(failures, entry.failures) + 1
                     val backoff = (baseBackoffMs * (1L shl failures.coerceAtMost(7))).coerceAtMost(MAX_BACKOFF_MS)
                     val serverWait = outcome.retryAfterMs ?: 0L
                     if (serverWait > 0) serverRetryAt = clock() + serverWait
@@ -373,6 +417,16 @@ internal class WriteOutbox(
             }
         }
     }
+
+    /**
+     * How long until the first entry still waiting out its first wait may go,
+     * or null when none waits - so the drain that stepped past it schedules
+     * the retry that sends it.
+     */
+    private fun firstAttemptWait(canSend: (OutboxEntry) -> Boolean, now: Long): Long? =
+        synchronized(lock) {
+            entries.filter { canSend(it) && waitingFirstAttempt(it, now) }.minOfOrNull { it.firstAttemptNotBefore - now }
+        }
 
     companion object {
         /** Same bound as the pre-initialization buffer. */

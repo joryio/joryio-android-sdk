@@ -327,10 +327,16 @@ internal class StorageManager(
         private const val KEY_CAMPAIGN_IMPRESSIONS = "campaign_impressions"
         private const val KEY_USER_SEGMENTS = "user_segments"
         private const val KEY_OUTBOX = "write_outbox"
+        private const val KEY_PLACEMENTS_CACHE = "placements_cache"
+        private const val KEY_CARDS_CACHE = "cards_cache"
+        private const val KEY_CARDS_DEVICE_STATE = "cards_device_state"
         private const val KEY_PUSH_UNREGISTERED = "push_unregistered"
         private const val KEY_PENDING_UNREGISTER = "pending_unregister"
+        private const val KEY_FLAGS_CACHE = "flags_cache"
+        private const val KEY_FLAG_EXPOSURES = "jry_flag_exposures"
         private const val KEY_RETIRED_AUTH_TOKENS = "retired_sdk_auth_tokens"
         private const val KEY_HELD_USER_ID = "held_user_id"
+        private const val KEY_SIGNED_IN_ANONYMOUS_IDS = "signed_in_anonymous_ids"
     }
 
     // MARK: - Retired SDK-auth tokens (owner decision D-a)
@@ -361,6 +367,26 @@ internal class StorageManager(
     fun setHeldUserId(userId: String?) {
         if (userId == null) prefs.edit().remove(KEY_HELD_USER_ID).apply()
         else prefs.edit().putString(KEY_HELD_USER_ID, userId).apply()
+    }
+
+    /**
+     * Anonymous ids that were tied to a signed-in user when a reset signed
+     * them out (resetTo refuses them; BACKLOG D366). Bounded by
+     * [ResetTo.SIGNED_IN_ANONYMOUS_IDS_MAX]; cleared by [clearAllData].
+     */
+    fun getSignedInAnonymousIds(): List<String> {
+        val raw = prefs.getString(KEY_SIGNED_IN_ANONYMOUS_IDS, null) ?: return emptyList()
+        return try {
+            val arr = org.json.JSONArray(raw)
+            List(arr.length()) { arr.optString(it) }.filter { it.isNotEmpty() }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    fun rememberSignedInAnonymousId(id: String) {
+        val next = ResetTo.remember(getSignedInAnonymousIds(), id)
+        prefs.edit().putString(KEY_SIGNED_IN_ANONYMOUS_IDS, org.json.JSONArray(next).toString()).apply()
     }
 
     // MARK: - Anonymous ID
@@ -525,6 +551,30 @@ internal class StorageManager(
 
     fun getOutbox(): String? = prefs.getString(KEY_OUTBOX, null)
 
+    /** The last placement answers, per person (placements/PlacementManager.kt); wipeData() clears it. */
+    fun getPlacementsCache(): String? = prefs.getString(KEY_PLACEMENTS_CACHE, null)
+
+    /** The last card feed, per person (cards/CardManager.kt); wipeData() clears it. */
+    fun getCardsCache(): String? = prefs.getString(KEY_CARDS_CACHE, null)
+
+    fun setCardsCache(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_CARDS_CACHE).apply()
+        else prefs.edit().putString(KEY_CARDS_CACHE, json).apply()
+    }
+
+    /** An anonymous visitor's read / dismissed card ids (`stateScope: "device"`); cleared on identify / reset. */
+    fun getCardsDeviceState(): String? = prefs.getString(KEY_CARDS_DEVICE_STATE, null)
+
+    fun setCardsDeviceState(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_CARDS_DEVICE_STATE).apply()
+        else prefs.edit().putString(KEY_CARDS_DEVICE_STATE, json).apply()
+    }
+
+    fun setPlacementsCache(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_PLACEMENTS_CACHE).apply()
+        else prefs.edit().putString(KEY_PLACEMENTS_CACHE, json).apply()
+    }
+
     fun setOutbox(json: String?) {
         if (json.isNullOrEmpty()) prefs.edit().remove(KEY_OUTBOX).apply()
         else prefs.edit().putString(KEY_OUTBOX, json).apply()
@@ -541,6 +591,22 @@ internal class StorageManager(
     }
 
     /** An unregister request the server has not confirmed yet (JSON). */
+    /** The last feature-flags answer, for one person (flags/FlagsManager.kt); clearAllData() removes it. */
+    fun getFlagsCache(): String? = prefs.getString(KEY_FLAGS_CACHE, null)
+
+    fun setFlagsCache(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_FLAGS_CACHE).apply()
+        else prefs.edit().putString(KEY_FLAGS_CACHE, json).apply()
+    }
+
+    /** The current session's flag exposure marks (flags/FlagsManager.kt, BACKLOG D479); clearAllData() removes them. */
+    fun getFlagExposures(): String? = prefs.getString(KEY_FLAG_EXPOSURES, null)
+
+    fun setFlagExposures(json: String?) {
+        if (json.isNullOrEmpty()) prefs.edit().remove(KEY_FLAG_EXPOSURES).apply()
+        else prefs.edit().putString(KEY_FLAG_EXPOSURES, json).apply()
+    }
+
     fun getPendingUnregister(): String? = prefs.getString(KEY_PENDING_UNREGISTER, null)
 
     fun setPendingUnregister(json: String?) {

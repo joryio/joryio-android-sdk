@@ -64,6 +64,34 @@ class WireFormatTest {
         assertTrue(WireJson.gson.toJson(restored).contains("\"qty\":2,"))
     }
 
+    /**
+     * 1.4.0-beta.9 test: React Native hands every JS number to Android as a
+     * Double, and Gson wrote 3.0 as `3.0` - on /track/batch and in a placement
+     * re-check - where iOS and the web send `3`.
+     */
+    @Test
+    fun `a whole-number Double goes on the wire as an integer, as on iOS and the web`() {
+        val props: Map<String, Any?> = mapOf(
+            "fromJs" to 3.0, "neg" to -2.0, "zero" to -0.0, "f" to 4.0f,
+            "int" to 3, "long" to 9_000_000_000L,
+            "frac" to 3.5, "small" to 0.1, "fracF" to 2.5f,
+            "nested" to mapOf("q" to 1.0, "l" to listOf(2.0, 2.25)),
+        )
+        val event = Event(type = "x", properties = props, timestamp = Date(0), anonymousId = "a", sessionId = "s", eventId = "e")
+        val wire = WireJson.gson.toJson(event)
+        val expected = "\"properties\":{\"fromJs\":3,\"neg\":-2,\"zero\":0,\"f\":4,\"int\":3,\"long\":9000000000," +
+            "\"frac\":3.5,\"small\":0.1,\"fracF\":2.5,\"nested\":{\"q\":1,\"l\":[2,2.25]}}"
+        assertTrue(wire, wire.contains(expected))
+        // Through the on-disk queue too (the /track/batch path).
+        val back = WireJson.gson.toJson(EventEntity.fromEvent(event).toEvent())
+        assertTrue(back, back.contains(expected))
+        // A JsonElement tree (a placement re-check's recheckEvent) is the same.
+        assertEquals("{\"n\":3,\"x\":3.5}", WireJson.gson.toJson(WireJson.gson.toJsonTree(mapOf("n" to 3.0, "x" to 3.5))))
+        assertFalse(WireJson.isWireInteger(Double.NaN))
+        assertFalse(WireJson.isWireInteger(Double.POSITIVE_INFINITY))
+        assertFalse(WireJson.isWireInteger(9.007199254740994E15))
+    }
+
     @Test
     fun `push tracking routes are built at the host root, not under api`() {
         // Fails on the old `${normalizedBaseUrl}track/push/...` (= /api/track/push).

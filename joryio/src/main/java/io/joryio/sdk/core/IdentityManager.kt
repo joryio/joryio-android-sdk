@@ -83,7 +83,7 @@ internal class IdentityManager(
      * A caller-supplied anonymous id (JoryioConfig.anonymousId) is dropped too:
      * it identified the outgoing session, not the device.
      */
-    fun reset() {
+    fun reset(anonymousId: String? = null) {
         // Drop un-acked writes for the OUTGOING user - sending them after a
         // reset would attribute one person's traits to the next.
         pending.clear()
@@ -93,7 +93,19 @@ internal class IdentityManager(
         attributes.clear()
         storage.clearUserAttributes()
         suppliedAnonymousId = null
-        storage.setAnonymousId(java.util.UUID.randomUUID().toString())
+        // resetTo(): the caller's id (validated by Joryio.resetTo), else a new random one.
+        storage.setAnonymousId(anonymousId ?: java.util.UUID.randomUUID().toString())
+    }
+
+    /**
+     * identify() of a DIFFERENT user: the in-memory trait bag is the previous
+     * user's, not the next one's (as on iOS and the web). It used to stay, so
+     * user A's `seats` / `ratio` rode in user B's flags evaluate and in-app
+     * sync (1.4.0-beta.10 test). Their unsent writes are sealed under their own
+     * ids first (Joryio.identify).
+     */
+    fun clearTraitBag() {
+        attributes.clear()
     }
 
     // MARK: - User Attributes (in-memory only — never persisted)

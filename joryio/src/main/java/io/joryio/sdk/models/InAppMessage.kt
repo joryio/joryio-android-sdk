@@ -102,6 +102,15 @@ data class InAppCampaign(
     val deliveryToken: String? = null,
 
     /**
+     * Joryio-signed proof that THIS form was served to THIS visitor (BACKLOG
+     * D371 item 4), present only when the message carries a form. Echoed as-is
+     * on the form submit; the server reads campaign, variant and form from it.
+     * Opaque; lives 24 hours, and every sync brings a fresh one.
+     */
+    @SerializedName("formToken")
+    val formToken: String? = null,
+
+    /**
      * Seconds to wait after the trigger fires before showing this message.
      *
      * Documented and collected in the dashboard long before anything sent or

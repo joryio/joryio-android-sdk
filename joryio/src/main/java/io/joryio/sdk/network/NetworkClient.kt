@@ -16,6 +16,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import io.joryio.sdk.core.SdkIdentity
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Response
 import retrofit2.Retrofit
@@ -95,6 +96,9 @@ internal class NetworkClient(
             return (date.time - now).coerceIn(0L, MAX_RETRY_AFTER_MS)
         }
         private const val SDK_AUTH_HEADER = "X-Joryio-Auth"
+        private const val FLAG_EXPOSURES_PATH = "/v1/flags/exposures"
+        /** Internal to this client: never sent, removed before a caller sees the response. */
+        private const val ORIGINAL_RETRY_AFTER_HEADER = "X-Joryio-Original-Retry-After"
 
         /** See [requestUserId]. */
         internal fun subjectUserIdOf(json: String): String? = try {
@@ -220,6 +224,9 @@ internal class NetworkClient(
             .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            // Outermost: puts back a flag-exposures 408's own Retry-After
+            // (see createNo408ResendNetworkInterceptor).
+            .addInterceptor(createRestoreRetryAfterInterceptor())
             .addInterceptor(createAuthInterceptor())
             // Added AFTER the SDK-key interceptor so this (inner) interceptor's
             // received request already carries the base headers; its one-shot
@@ -230,6 +237,7 @@ internal class NetworkClient(
                     addInterceptor(createLoggingInterceptor())
                 }
             }
+            .addNetworkInterceptor(createNo408ResendNetworkInterceptor())
             .build()
 
         val retrofit = Retrofit.Builder()
@@ -243,15 +251,58 @@ internal class NetworkClient(
     }
 
     /**
+     * A 408 on POST /v1/flags/exposures goes back to the FlagsManager as it
+     * came, not re-sent by OkHttp (1.4.0-beta.15).
+     *
+     * With `retryOnConnectionFailure` on - kept on since 1.4.0-beta.12 for
+     * stale pooled connections - OkHttp's RetryAndFollowUpInterceptor sends a
+     * request again, at once, after a 408 that has no Retry-After (or
+     * `Retry-After: 0`). The beta.14 test saw an exposures batch re-sent 12 ms
+     * after its 408, skipping the first wait the FlagsManager / outbox apply
+     * (iOS and web wait: URLSession and fetch never re-send a 408). OkHttp
+     * leaves a 408 alone when it carries a positive Retry-After, so this
+     * NETWORK interceptor (inside the retry loop) gives an exposures 408 one,
+     * remembering what the server sent; [createRestoreRetryAfterInterceptor]
+     * puts that back before anyone reads it. Stale-connection recovery is
+     * untouched: it never sees a response.
+     */
+    private fun createNo408ResendNetworkInterceptor(): Interceptor = Interceptor { chain ->
+        val response = chain.proceed(chain.request())
+        if (response.code != 408 || !chain.request().url.encodedPath.endsWith(FLAG_EXPOSURES_PATH)) {
+            return@Interceptor response
+        }
+        val original = response.header("Retry-After")
+        // OkHttp's rule: no header, or a whole number of seconds that is zero, means "re-send now".
+        val reSentByOkHttp = original == null || original.matches(Regex("0+"))
+        if (!reSentByOkHttp) return@Interceptor response
+        response.newBuilder()
+            .header("Retry-After", "1")
+            .header(ORIGINAL_RETRY_AFTER_HEADER, original ?: "")
+            .build()
+    }
+
+    /** Undoes [createNo408ResendNetworkInterceptor]'s Retry-After: callers see the server's own header. */
+    private fun createRestoreRetryAfterInterceptor(): Interceptor = Interceptor { chain ->
+        val response = chain.proceed(chain.request())
+        val original = response.header(ORIGINAL_RETRY_AFTER_HEADER) ?: return@Interceptor response
+        response.newBuilder()
+            .removeHeader(ORIGINAL_RETRY_AFTER_HEADER)
+            .apply { if (original.isEmpty()) removeHeader("Retry-After") else header("Retry-After", original) }
+            .build()
+    }
+
+    /**
      * Create auth interceptor for SDK key
      */
     private fun createAuthInterceptor(): Interceptor {
         return Interceptor { chain ->
-            val request = chain.request().newBuilder()
+            val builder = chain.request().newBuilder()
+            // X-Joryio-SDK, X-Joryio-SDK-Version and - from a React Native or
+            // Unity bridge - X-Joryio-SDK-Wrapper(-Version). See SdkIdentity.
+            for ((name, value) in SdkIdentity.headers()) builder.header(name, value)
+            val request = builder
                 .addHeader("Authorization", "Bearer $sdkKey")
                 .addHeader("Content-Type", "application/json")
-                .addHeader("X-Joryio-SDK", "android")
-                .addHeader("X-Joryio-SDK-Version", Logger.SDK_VERSION)
                 // Identify ourselves. Without this OkHttp sends its default
                 // `okhttp/4.x`, which server-side bot heuristics classify as an
                 // automated HTTP client — so /v1/in-app/sync answered
@@ -704,6 +755,13 @@ internal class NetworkClient(
         }
     }
 
+    /** Click-link identity. 4xx is never retried; 5xx gets the normal retry (executeWithRetry). */
+    suspend fun identifyLink(request: IdentifyLinkRequest): NetworkResult<IdentifyLinkResponse> {
+        return executeWithRetry("identifyLink") {
+            api.identifyLink(request)
+        }
+    }
+
     suspend fun addAlias(request: AddAliasRequest): NetworkResult<AliasResponse> {
         return executeWithRetry("addAlias") {
             api.addAlias(request)
@@ -726,6 +784,53 @@ internal class NetworkClient(
             .toRequestBody("application/json; charset=utf-8".toMediaType())
         return executeWithRetry("POST $path") {
             api.postJson(path, body)
+        }
+    }
+
+    /**
+     * Feature flags (flags/FlagsManager.kt): POST [path] - no SDK retries,
+     * the held answer stays in use until the next refresh.
+     *
+     * OkHttp's own connection-failure recovery stays ON (1.4.0-beta.12): a
+     * request written to a pooled connection the server had already closed
+     * (keep-alive expiry, the ALB's idle timeout, a NAT or carrier drop)
+     * fails with "unexpected end of stream" before any answer, and only that
+     * recovery sends it again on a fresh connection. 1.4.0-beta.11 switched
+     * it off and the first flags / placements / cards call after an idle
+     * minute failed. An evaluate is a read; an exposures batch carries its
+     * `idempotencyKey`, so a re-sent copy is counted once by the server. The
+     * SDK-authentication token follows the body's `userId`, like every other
+     * request. Returns the body of a 2xx answer, else null.
+     */
+    suspend fun postFlags(path: String, json: String): String? = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.postFlags(path, body)
+            if (response.isSuccessful) response.body()?.string() else null
+        } catch (e: Exception) {
+            logger.debug("Flags request failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * POST an exposures batch ([postFlags]' transport): the HTTP status
+     * (0 = no answer) and the server's Retry-After, so the FlagsManager can
+     * tell a batch the server took (or refused for good) from one to send
+     * again with the same `idempotencyKey`.
+     */
+    suspend fun postFlagExposures(json: String): io.joryio.sdk.flags.FlagsPostStatus = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext io.joryio.sdk.flags.FlagsPostStatus(0)
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.postFlags("v1/flags/exposures", body)
+            response.body()?.close()
+            response.errorBody()?.close()
+            io.joryio.sdk.flags.FlagsPostStatus(response.code(), parseRetryAfterMs(response.headers()["Retry-After"]))
+        } catch (e: Exception) {
+            logger.debug("Flag exposures request failed: ${e.message}")
+            io.joryio.sdk.flags.FlagsPostStatus(0)
         }
     }
 
@@ -752,6 +857,41 @@ internal class NetworkClient(
     suspend fun syncInAppMessages(request: io.joryio.sdk.models.SessionSyncRequest): NetworkResult<io.joryio.sdk.models.SessionSyncResponse> {
         return executeWithRetry("syncInAppMessages") {
             api.syncInAppMessages(request)
+        }
+    }
+
+    /**
+     * POST v1/in-app/placements - no SDK retries (OkHttp's stale-connection
+     * recovery only, see [postFlags]): a placement answer is only
+     * useful now, and a 429 (the per-device limit) means "keep your cache".
+     * Returns the HTTP status (0 = no answer) and, on success, the body.
+     */
+    suspend fun fetchPlacements(json: String): Pair<Int, String?> = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext 0 to null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.fetchPlacements(body)
+            response.code() to (if (response.isSuccessful) response.body()?.string() else null)
+        } catch (e: Exception) {
+            logger.debug("Placements request failed: ${e.message}")
+            0 to null
+        }
+    }
+
+    /**
+     * POST v1/in-app/cards - no SDK retries, like placements: a 429 (the
+     * per-device limit) or a failure means "keep your cached feed".
+     * Returns the HTTP status (0 = no answer) and, on success, the body.
+     */
+    suspend fun fetchCards(json: String): Pair<Int, String?> = withContext(Dispatchers.IO) {
+        if (!isNetworkAvailable()) return@withContext 0 to null
+        try {
+            val body = json.toByteArray(Charsets.UTF_8).toRequestBody("application/json; charset=utf-8".toMediaType())
+            val response = api.fetchCards(body)
+            response.code() to (if (response.isSuccessful) response.body()?.string() else null)
+        } catch (e: Exception) {
+            logger.debug("Card feed request failed: ${e.message}")
+            0 to null
         }
     }
 

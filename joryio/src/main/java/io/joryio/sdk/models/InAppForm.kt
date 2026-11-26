@@ -19,6 +19,10 @@ internal data class InAppFormSubmitRequest(
     @SerializedName("anonymousId")
     val anonymousId: String,
 
+    /** The form token served with the message; Gson omits it when null (an older server). */
+    @SerializedName("formToken")
+    val formToken: String? = null,
+
     @SerializedName("values")
     val values: Map<String, Any?>,
 )
@@ -36,4 +40,12 @@ internal data class InAppFormSubmitResponse(
 
     @SerializedName("errors")
     val errors: List<String>? = null,
+
+    /**
+     * Why the server refused the form before reading its values, when it did:
+     * form_token_invalid, form_token_expired, form_token_required,
+     * form_changed or form_token_used (BACKLOG D371 item 4).
+     */
+    @SerializedName("reason")
+    val reason: String? = null,
 )

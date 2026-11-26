@@ -19,6 +19,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import io.joryio.sdk.InAppMessagePresenter
+import io.joryio.sdk.core.JoryioLinkSource
+import io.joryio.sdk.core.LinkRouter
 import io.joryio.sdk.models.InAppCampaign
 import io.joryio.sdk.models.ButtonAction
 import io.joryio.sdk.models.InAppContent
@@ -188,7 +190,7 @@ internal class InAppMessageRenderer(
                     }
                 },
                 onEvent = { action, meta -> activity.runOnUiThread { onEvent(action, meta) } },
-                openUrl = { url -> activity.runOnUiThread { openExternally(activity, url) } },
+                openUrl = { url -> activity.runOnUiThread { openExternally(activity, url, campaign.id) } },
                 requestPush = { activity.runOnUiThread { requestPushPermission(activity) } },
             ),
             BRIDGE,
@@ -218,7 +220,7 @@ internal class InAppMessageRenderer(
                 val url = req.url?.toString() ?: return true
                 val tapped = req.hasGesture() && req.isForMainFrame
                 if (navigationOpensExternally(url, tapped)) {
-                    openExternally(activity, url)
+                    openExternally(activity, url, campaign.id)
                     onEvent("clicked", mapOf("action" to "link", "url" to url))
                 }
                 return true
@@ -231,7 +233,7 @@ internal class InAppMessageRenderer(
                 val target = url ?: return true
                 val tapped = android.os.SystemClock.uptimeMillis() - lastTouchAt < TAP_WINDOW_MS
                 if (navigationOpensExternally(target, tapped)) {
-                    openExternally(activity, target)
+                    openExternally(activity, target, campaign.id)
                     onEvent("clicked", mapOf("action" to "link", "url" to target))
                 }
                 return true
@@ -295,7 +297,7 @@ internal class InAppMessageRenderer(
             override fun onButton(buttonId: String, action: ButtonAction, url: String?) {
                 onEvent("clicked", mapOf("action" to buttonId.ifBlank { "button" }))
                 when (action) {
-                    ButtonAction.URL, ButtonAction.DEEP_LINK -> url?.let { openExternally(activity, it) }
+                    ButtonAction.URL, ButtonAction.DEEP_LINK -> url?.let { openExternally(activity, it, campaign.id) }
                     ButtonAction.REQUEST_PUSH_PERMISSION ->
                         // Reflective: joryio-ui must not gain a compile-time
                         // dependency on the base SDK's Joryio class - the split
@@ -627,12 +629,21 @@ internal class InAppMessageRenderer(
         }
     }
 
-    private fun openExternally(activity: Activity, url: String) {
-        if (!isSafeUrl(url)) return
-        try {
-            activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-        } catch (e: Exception) {
-            UiLog.warn("No activity to open $url: ${e.message}")
+    /**
+     * A link in a message: http(s) or an app deep link, through the app-wide
+     * link handler first (`Joryio.setLinkHandler`, source in_app). Without a
+     * handler (or when it declines) http(s) opens with the system as before,
+     * and an app deep link - which a message has no `onDeepLink` for - is not
+     * opened. Anything else is refused before the handler sees it.
+     */
+    private fun openExternally(activity: Activity, url: String, campaignId: String) {
+        LinkRouter.route(url, JoryioLinkSource.IN_APP, campaignId = campaignId) {
+            if (!isSafeUrl(url)) return@route
+            try {
+                activity.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            } catch (e: Exception) {
+                UiLog.warn("No activity to open $url: ${e.message}")
+            }
         }
     }
 
