@@ -192,6 +192,56 @@ class QueueManagerTest {
         assertEquals(listOf(listOf("new")), sent)
     }
 
+    /**
+     * An optOut() that lands after a flush read its rows and before the request
+     * starts. Before the fix the rows read under the old generation went out
+     * anyway - and with an optIn() right after (a consent toggle flipped twice)
+     * nothing in the flush noticed: an event tracked before optOut() was sent
+     * or dropped depending on where the periodic flush happened to be.
+     */
+    @Test
+    fun `rows read before an opt-out are never sent by a request that starts after it`() = runBlocking {
+        val inner = FakeEventDao()
+        var onRead: (() -> Unit)? = null
+        val hooked = object : EventDao by inner {
+            override suspend fun getEvents(limit: Int): List<EventEntity> =
+                inner.getEvents(limit).also { onRead?.invoke() }
+        }
+        val q = QueueManager(
+            eventDao = hooked,
+            logger = Logger(false, LogLevel.ERROR),
+            batchSize = 50,
+            flushInterval = 60_000,
+            maxQueueSize = 1000,
+            clock = { now },
+        )
+        queue = q
+        q.stopAutoFlush()
+        q.onFlush = { batch ->
+            sent.add(batch.events.map { it.type })
+            BatchSendResult.Accepted
+        }
+        q.enqueue(event("tracked before optOut"))
+        // optOut() then optIn() at once, between the read and the request:
+        // the clear is requested and sending is allowed again.
+        onRead = {
+            onRead = null
+            q.paused = true
+            q.requestClear()
+            q.paused = false
+        }
+        q.flush(force = true)
+        q.flush(force = true)
+        assertEquals("nothing tracked before the opt-out is sent", emptyList<List<String>>(), sent)
+        assertEquals(emptyList<String>(), inner.rows.map { it.type })
+
+        // And while the opt-out holds, a batch read before it waits too.
+        q.enqueue(event("x"))
+        onRead = { onRead = null; q.paused = true }
+        q.flush(force = true)
+        assertEquals(emptyList<List<String>>(), sent)
+    }
+
     @Test
     fun `responses map onto the contract`() {
         assertEquals(BatchSendResult.Accepted, BatchSendResult.from(NetworkResult.Success(BatchResponse(success = true, processed = 1))))

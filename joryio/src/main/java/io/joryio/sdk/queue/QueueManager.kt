@@ -335,9 +335,12 @@ internal class QueueManager(
             clearIfRequested()
             var rounds = 0
             while (rounds++ < MAX_BATCHES_PER_FLUSH && !paused && !suspendedForSession) {
+                // Taken BEFORE the read: rows read under one generation are
+                // never sent under the next (see [sendChunk]).
+                val readAt = generation
                 val entities = eventDao.getEvents(batchSize)
                 if (entities.isEmpty()) break
-                if (!sendChunk(withinByteLimit(sameUser(entities)))) break
+                if (!sendChunk(withinByteLimit(sameUser(entities)), readAt)) break
             }
             refreshCount()
         } catch (e: Exception) {
@@ -413,7 +416,7 @@ internal class QueueManager(
      * Send one chunk and apply the outcome. True when the queue may continue
      * with the next chunk.
      */
-    private suspend fun sendChunk(entities: List<EventEntity>): Boolean {
+    private suspend fun sendChunk(entities: List<EventEntity>, readAt: Int): Boolean {
         val sender = onFlush ?: return false
 
         // A row that cannot be decoded can never be sent; it must not block
@@ -427,6 +430,16 @@ internal class QueueManager(
         }
         if (decoded.isEmpty()) return true
 
+        // An optOut() (or a denial) since these rows were read discards them,
+        // and no request may start with them after it - also when optIn()
+        // followed at once, which lifts [paused] again. Checked last, right
+        // before the request: an event tracked before optOut() goes out only
+        // in a request that had already started when optOut() was called
+        // (the same rule as iOS and web).
+        if (paused || generation != readAt) {
+            logger.debug("Queue cleared or paused since this batch was read; not sending it")
+            return false
+        }
         val ids = decoded.map { it.first.id }
         logger.debug("Sending batch of ${decoded.size} events")
         val outcome = sender(EventBatch(events = decoded.map { it.second }, sentAt = Date()))
@@ -503,7 +516,7 @@ internal class QueueManager(
                     val mid = decoded.size / 2
                     val first = decoded.subList(0, mid).map { it.first }
                     val second = decoded.subList(mid, decoded.size).map { it.first }
-                    sendChunk(first) && sendChunk(second)
+                    sendChunk(first, readAt) && sendChunk(second, readAt)
                 }
             }
             is BatchSendResult.Suspended -> {

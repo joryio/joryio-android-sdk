@@ -2,6 +2,8 @@
 
 ## 1.4.0 - 2026-11-18
 
+Fixed (1.4.0-beta.16): an event tracked just before `optOut()` is handled the same way every time - dropped, unless a request carrying it had already started when `optOut()` was called. A flush that had read its batch from the queue before the opt-out still sent it, and an `optIn()` right after (a consent switch flipped twice) did not stop it either; the batch is now checked against the opt-out right before the request. Events tracked before `optOut()` and inserted after it were already discarded. The same rule on iOS, web and both bridges. No wire changes.
+
 Fixed (1.4.0-beta.15): a flags refresh at app foreground could die with a `NullPointerException` in `getFlagsAppVersion` and be lost - seen on cold launches after the session had expired, from React Native. `initialize()` there runs on a background thread, so the lifecycle observer is posted to the main thread and its `ON_START` can run while the SDK is still being constructed; the app-version property (and the attribute retry state) the foreground path reads were declared below `init {}` and were still null. They are declared ahead of it now, and a test runs a flags refresh from the very end of `init {}`.
 
 Fixed (1.4.0-beta.15): a 408 on `POST /v1/flags/exposures` was sent again by OkHttp about 12 ms later (its `RetryAndFollowUpInterceptor` re-sends a 408 without `Retry-After` while `retryOnConnectionFailure` is on), skipping the first wait the outbox applies since 1.4.0-beta.14. That 408 now comes back to the SDK as it came and the batch waits in the outbox, as on iOS and the web. Only this request changes, and the stale-connection recovery of 1.4.0-beta.12 is untouched (it never sees a response).
